@@ -28,6 +28,7 @@ An Orca plugin to orchestrate agile startup workflows, multi-agent sprint pipeli
      - View sprint timeline, capacity in story points, and sprint goals.
      - **+ New Sprint**: Create upcoming iterations with custom start/end dates and target points.
      - **Complete Sprint with Task Rollover**: Archive completed sprints and automatically roll over unfinished tasks to an active or planning target sprint.
+     - **Delete Sprint**: Delete sprints with inline confirmation and choose to move existing tasks to another sprint or remove them with the sprint.
 
 3. **Default Startup Company Workflows**:
    - **Agile Sprint: Feature Epic Delivery**: 5-stage pipeline chaining:

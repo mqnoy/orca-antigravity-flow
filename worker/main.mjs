@@ -173,6 +173,15 @@ function cleanJson(val) {
 }
 
 /**
+ * Clamps a terminal title to Orca host's 512-character limit.
+ * @param {string} title
+ * @returns {string}
+ */
+function clampTerminalTitle(title) {
+  return title.length > 512 ? `${title.slice(0, 509)}...` : title
+}
+
+/**
  * Escapes a command argument or environment variable for shell execution.
  * @param {string} value
  * @param {boolean} isWin
@@ -474,8 +483,8 @@ export default async function activate(orca) {
         timestamp: Date.now(),
         type,
         title,
-        details: details || undefined,
-        workspaceId: workspaceId || undefined
+        ...(details ? { details } : {}),
+        ...(workspaceId ? { workspaceId } : {})
       }
 
       const updatedActivities = [event, ...activities].slice(0, 100)
@@ -556,7 +565,7 @@ export default async function activate(orca) {
       stats[account.id] = {
         accountId: account.id,
         accountName: account.name,
-        personaName: account.personaName,
+        ...(account.personaName ? { personaName: account.personaName } : {}),
         totalSummons: summons,
         workflowStepsExecuted: workflowSteps,
         workItemsCompleted: completedTasks.length,
@@ -1082,8 +1091,8 @@ export default async function activate(orca) {
     await storageSet(STORAGE_KEY_WORKFLOWS, defaultWorkflows)
   }
 
-  const initialSprints = await getStoredSprints()
-  if (initialSprints.length === 0) {
+  const rawSprints = await orca.storage.get(STORAGE_KEY_SPRINTS)
+  if (!Array.isArray(rawSprints)) {
     /** @type {import('../src/protocol').AgileSprint[]} */
     const defaultSprints = [
       {
@@ -1429,7 +1438,7 @@ export default async function activate(orca) {
     })
 
     const personaLabel = account.personaName ? ` - ${account.personaName}` : ''
-    const title = `agy (${account.name}${personaLabel})`
+    const title = clampTerminalTitle(`agy (${account.name}${personaLabel})`)
     const outcome = await orca.host.call('terminal.create', {
       workspaceId: targetWorkspaceId,
       title,
@@ -1494,7 +1503,7 @@ export default async function activate(orca) {
       ? `set "HOME=${account.home}" && set "GEMINI_HOME=${account.geminiHome}" && set "DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null" && ${agyCmd}`
       : `env HOME=${escapeShellArg(account.home, false)} GEMINI_HOME=${escapeShellArg(account.geminiHome, false)} DBUS_SESSION_BUS_ADDRESS="unix:path=/dev/null" ${agyCmd}`
 
-    const title = `[Sign in] ${account.name}`
+    const title = clampTerminalTitle(`[Sign in] ${account.name}`)
     const outcome = await orca.host.call('terminal.create', {
       workspaceId: targetWorkspaceId,
       title,
@@ -1559,7 +1568,11 @@ export default async function activate(orca) {
     return { ok: true, workflows: updated }
   })
 
-  orca.panels.handle('workflows.execute', async ({ workflowId, workspaceId }) => {
+  orca.panels.handle('workflows.execute', async (params = {}) => {
+    const { workflowId, workspaceId } = params || {}
+    if (typeof workflowId !== 'string' || !workflowId.trim()) {
+      throw new Error('Workflow ID is required')
+    }
     const targetWorkspaceId = await resolveTargetWorkspace(workspaceId)
     if (!targetWorkspaceId) {
       throw new Error('Target workspace is required to execute workflow')
@@ -1612,7 +1625,9 @@ export default async function activate(orca) {
 
       const personaLabel = account.personaName ? ` [${account.personaName}]` : ''
       const laneLabel = step.statusLane ? ` [${step.statusLane}]` : ''
-      const title = `[Workflow: ${wf.name}] #${i + 1} ${step.name}${laneLabel} (${account.name}${personaLabel})`
+      const title = clampTerminalTitle(
+        `[Workflow: ${wf.name}] #${i + 1} ${step.name}${laneLabel} (${account.name}${personaLabel})`
+      )
       await orca.host.call('terminal.create', {
         workspaceId: targetWorkspaceId,
         title,
@@ -1722,6 +1737,72 @@ export default async function activate(orca) {
       lanes: ORCA_DEFAULT_BOARD_LANES
     })
     return { ok: true, sprints, workItems: updatedItems }
+  })
+
+  orca.panels.handle('board.deleteSprint', async ({ sprintId, moveToSprintId } = {}) => {
+    if (typeof sprintId !== 'string' || !sprintId.trim()) {
+      throw new Error('Sprint ID is required')
+    }
+    const targetId = sprintId.trim()
+    const sprints = await getStoredSprints()
+    const workItems = await getStoredWorkItems()
+    const epics = await getStoredEpics()
+
+    if (!sprints.some((s) => s.id === targetId)) {
+      throw new Error(`Sprint "${targetId}" not found`)
+    }
+
+    const updatedSprints = sprints.filter((s) => s.id !== targetId)
+    const targetMoveId = typeof moveToSprintId === 'string' ? moveToSprintId.trim() : ''
+
+    if (targetMoveId) {
+      if (targetMoveId === targetId) {
+        throw new Error('Cannot move work items to the sprint being deleted')
+      }
+      if (!updatedSprints.some((s) => s.id === targetMoveId)) {
+        throw new Error(`Target sprint "${targetMoveId}" not found`)
+      }
+    }
+
+    const updatedItems = targetMoveId
+      ? workItems.map((item) =>
+          item.sprintId === targetId
+            ? { ...item, sprintId: targetMoveId, updatedAt: Date.now() }
+            : item
+        )
+      : workItems.filter((item) => item.sprintId !== targetId)
+
+    let epicsChanged = false
+    const updatedEpics = epics.map((epic) => {
+      if (epic.targetSprintId !== targetId) return epic
+      epicsChanged = true
+      if (targetMoveId) {
+        return { ...epic, targetSprintId: targetMoveId }
+      }
+      const { targetSprintId: _removed, ...rest } = epic
+      return rest
+    })
+
+    await storageSet(STORAGE_KEY_SPRINTS, updatedSprints)
+    await storageSet(STORAGE_KEY_WORKITEMS, updatedItems)
+    if (epicsChanged) {
+      await storageSet(STORAGE_KEY_EPICS, updatedEpics)
+    }
+
+    orca.panels.post('board.changed', {
+      sprints: updatedSprints,
+      epics: updatedEpics,
+      workItems: updatedItems,
+      lanes: ORCA_DEFAULT_BOARD_LANES
+    })
+
+    return {
+      ok: true,
+      deletedSprintId: targetId,
+      sprints: updatedSprints,
+      workItems: updatedItems,
+      epics: updatedEpics
+    }
   })
 
   orca.panels.handle('board.saveEpic', async ({ epic }) => {
@@ -1901,7 +1982,7 @@ export default async function activate(orca) {
       promptFile
     })
 
-    const title = `[Agile: ${item.id}] ${item.title} (${account.name})`
+    const title = clampTerminalTitle(`[Agile: ${item.id}] ${item.title} (${account.name})`)
     const outcome = await orca.host.call('terminal.create', {
       workspaceId: targetWorkspaceId,
       title,

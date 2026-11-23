@@ -309,7 +309,7 @@ declare module 'orca' {
     'workflows.execute': {
       input: {
         workflowId: string
-        workspaceId: string
+        workspaceId?: string
       }
       output: {
         ok: boolean
@@ -330,7 +330,7 @@ declare module 'orca' {
     'board.getAgileState': {
       input: {
         workspaceId?: string
-      }
+      } | void
       output: {
         sprints: AgileSprint[]
         epics: AgileEpic[]
@@ -408,6 +408,21 @@ declare module 'orca' {
         ok: boolean
         sprints: AgileSprint[]
         workItems: AgileWorkItem[]
+      }
+    }
+
+    /** Delete an Agile Sprint and optionally move its work items to another sprint */
+    'board.deleteSprint': {
+      input: {
+        sprintId: string
+        moveToSprintId?: string
+      }
+      output: {
+        ok: boolean
+        deletedSprintId: string
+        sprints: AgileSprint[]
+        workItems: AgileWorkItem[]
+        epics: AgileEpic[]
       }
     }
 

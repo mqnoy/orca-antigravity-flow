@@ -127,6 +127,10 @@ const newSprintPoints = atom<string>('20')
 const showCompleteSprint = atom<boolean>(false)
 const rolloverSprintId = atom<string>('')
 
+// Delete Sprint Dialog State
+const deletingSprintId = atom<string | null>(null)
+const deleteSprintTargetId = atom<string>('')
+
 // Epic Management Atoms
 const showAddEpic = atom<boolean>(false)
 const newEpicName = atom<string>('')
@@ -571,14 +575,17 @@ async function saveSprint(): Promise<void> {
 
   try {
     set(isBusy, true)
+    const goal = read(newSprintGoal).trim()
+    const startDate = read(newSprintStart).trim()
+    const endDate = read(newSprintEnd).trim()
     const sprint: AgileSprint = {
       id: `sprint-${Date.now()}`,
       name,
-      goal: read(newSprintGoal).trim() || undefined,
       status: read(newSprintStatus),
-      startDate: read(newSprintStart).trim() || undefined,
-      endDate: read(newSprintEnd).trim() || undefined,
-      targetPoints: parseInt(read(newSprintPoints), 10) || 20
+      targetPoints: parseInt(read(newSprintPoints), 10) || 20,
+      ...(goal ? { goal } : {}),
+      ...(startDate ? { startDate } : {}),
+      ...(endDate ? { endDate } : {})
     }
 
     const res = await plugin.request('board.saveSprint', { sprint })
@@ -628,6 +635,149 @@ async function completeActiveSprint(sprintId: string): Promise<void> {
   }
 }
 
+/** Pick the best fallback sprint id from a sprint list */
+function resolveFallbackSprintId(sprintList: AgileSprint[]): string {
+  return (
+    sprintList.find((s) => s.status === 'active')?.id ||
+    sprintList.find((s) => s.status === 'planning')?.id ||
+    sprintList[0]?.id ||
+    ''
+  )
+}
+
+/** Open inline delete sprint confirmation and default task handling target */
+function openDeleteSprintConfirm(sprintId: string): void {
+  set(deletingSprintId, sprintId)
+  set(showCompleteSprint, false)
+  const remaining = read(sprints).filter((s) => s.id !== sprintId)
+  const sprintTasks = read(workItems).filter((i) => i.sprintId === sprintId)
+  if (sprintTasks.length > 0 && remaining.length > 0) {
+    const defaultTarget =
+      remaining.find((s) => s.status === 'active') ||
+      remaining.find((s) => s.status === 'planning') ||
+      remaining[0]
+    set(deleteSprintTargetId, defaultTarget.id)
+  } else {
+    set(deleteSprintTargetId, '__delete__')
+  }
+}
+
+/** Cancel inline delete sprint confirmation */
+function cancelDeleteSprint(): void {
+  set(deletingSprintId, null)
+  set(deleteSprintTargetId, '')
+}
+
+/** Confirm deleting a sprint and optionally moving its work items */
+async function confirmDeleteSprint(sprintId: string): Promise<void> {
+  const sprintName = read(sprints).find((s) => s.id === sprintId)?.name || sprintId
+  const target = read(deleteSprintTargetId).trim()
+  const payload: { sprintId: string; moveToSprintId?: string } = { sprintId }
+  if (target && target !== '__delete__' && target !== sprintId) {
+    payload.moveToSprintId = target
+  }
+
+  try {
+    set(isBusy, true)
+    const res = await plugin.request('board.deleteSprint', payload)
+    set(sprints, res.sprints)
+    set(workItems, res.workItems)
+    set(epics, res.epics)
+    set(deletingSprintId, null)
+    set(deleteSprintTargetId, '')
+    set(showCompleteSprint, false)
+
+    const fallbackId = resolveFallbackSprintId(res.sprints)
+    const curSelected = read(selectedSprintId)
+    if (curSelected === sprintId || !res.sprints.some((s) => s.id === curSelected)) {
+      set(selectedSprintId, fallbackId)
+    }
+    const curNewItemSprint = read(newItemSprintId)
+    if (curNewItemSprint === sprintId || !res.sprints.some((s) => s.id === curNewItemSprint)) {
+      set(newItemSprintId, fallbackId)
+    }
+
+    if (payload.moveToSprintId) {
+      const targetName =
+        res.sprints.find((s) => s.id === payload.moveToSprintId)?.name || payload.moveToSprintId
+      set(statusNotice, {
+        tone: 'success',
+        message: `Sprint "${sprintName}" deleted and its work items were moved to "${targetName}".`
+      })
+    } else {
+      set(statusNotice, {
+        tone: 'success',
+        message: `Sprint "${sprintName}" and its work items were deleted.`
+      })
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    set(statusNotice, { tone: 'danger', message: `Failed to delete sprint: ${msg}` })
+  } finally {
+    set(isBusy, false)
+  }
+}
+
+/** Render shared inline delete sprint confirmation controls */
+function renderDeleteSprintConfirmBody(
+  sprint: AgileSprint,
+  taskCount: number,
+  sprintList: AgileSprint[],
+  busy: boolean
+) {
+  const otherSprints = sprintList.filter((s) => s.id !== sprint.id)
+  const targetOptions = [
+    ...otherSprints.map((s) => ({
+      label: `Move ${taskCount} task(s) to ${s.name}`,
+      value: s.id
+    })),
+    {
+      label: `Delete all ${taskCount} task(s) with this sprint`,
+      value: '__delete__'
+    }
+  ]
+
+  return (
+    <Stack gap="sm">
+      <Text size="xs">
+        {taskCount === 0
+          ? 'This sprint has 0 work items and can be safely removed.'
+          : `${taskCount} work item(s) are currently assigned to this sprint.`}
+      </Text>
+      {taskCount > 0 ? (
+        otherSprints.length > 0 ? (
+          <Select
+            label="Work items in this sprint:"
+            options={targetOptions}
+            value={read(deleteSprintTargetId) || otherSprints[0]?.id || '__delete__'}
+            onChange={(val) => set(deleteSprintTargetId, val ?? '__delete__')}
+            disabled={busy}
+          />
+        ) : (
+          <Text size="xs" muted>
+            No other sprint exists. All {taskCount} work item(s) in this sprint will be permanently
+            deleted with it.
+          </Text>
+        )
+      ) : null}
+      <Row justify="end" gap="xs">
+        <Button variant="ghost" size="sm" disabled={busy} onPress={cancelDeleteSprint}>
+          Cancel
+        </Button>
+        <Button
+          variant="solid"
+          tone="danger"
+          size="sm"
+          disabled={busy}
+          onPress={() => void confirmDeleteSprint(sprint.id)}
+        >
+          Confirm Delete
+        </Button>
+      </Row>
+    </Stack>
+  )
+}
+
 /** Save Agile Epic */
 async function saveEpic(): Promise<void> {
   const name = read(newEpicName).trim()
@@ -638,12 +788,13 @@ async function saveEpic(): Promise<void> {
 
   try {
     set(isBusy, true)
+    const description = read(newEpicDesc).trim()
     const epic: AgileEpic = {
       id: `epic-${Date.now()}`,
       name,
-      description: read(newEpicDesc).trim() || undefined,
       color: read(newEpicColor) || 'accent',
-      status: read(newEpicStatus)
+      status: read(newEpicStatus),
+      ...(description ? { description } : {})
     }
 
     const res = await plugin.request('board.saveEpic', { epic })
@@ -683,16 +834,18 @@ async function saveAgileWorkItem(): Promise<void> {
 
   try {
     set(isBusy, true)
+    const description = read(newItemDesc).trim()
+    const assignedAccountId = read(newItemAccountId)
     const item: AgileWorkItem = {
       id: `task-${Date.now()}`,
       title,
-      description: read(newItemDesc).trim() || undefined,
       epicId: read(newItemEpicId),
       sprintId: read(newItemSprintId),
       status: read(newItemStatus),
-      assignedAccountId: read(newItemAccountId) || undefined,
       storyPoints: parseInt(read(newItemPoints), 10) || 3,
-      updatedAt: Date.now()
+      updatedAt: Date.now(),
+      ...(description ? { description } : {}),
+      ...(assignedAccountId ? { assignedAccountId } : {})
     }
 
     const res = await plugin.request('board.saveWorkItem', { item })
@@ -738,10 +891,9 @@ async function summonAgentForWorkItem(itemId: string): Promise<void> {
   const wsId = read(selectedWorkspaceId)
   try {
     set(isBusy, true)
-    const res = await plugin.request('board.summonWorkItem', {
-      itemId,
-      workspaceId: wsId && wsId !== 'active' ? wsId : undefined
-    })
+    const payload: { itemId: string; workspaceId?: string } = { itemId }
+    if (wsId && wsId !== 'active') payload.workspaceId = wsId
+    const res = await plugin.request('board.summonWorkItem', payload)
     set(statusNotice, {
       tone: 'success',
       message: `Started agent (${res.accountName}) for "${res.itemTitle}"!`
@@ -801,8 +953,8 @@ function addWorkflowStep(): void {
     name,
     accountId,
     prompt,
-    customFlags: flags || undefined,
-    statusLane: lane
+    statusLane: lane,
+    ...(flags ? { customFlags: flags } : {})
   }
 
   const existing = read(wfSteps)
@@ -829,12 +981,13 @@ async function saveWorkflow(): Promise<void> {
     set(isBusy, true)
     set(statusNotice, null)
     const wsId = read(selectedWorkspaceId)
+    const description = read(wfDesc).trim()
     const workflow: ProjectWorkflow = {
       id: name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
       name,
-      description: read(wfDesc).trim() || undefined,
-      workspaceId: wsId && wsId !== 'active' ? wsId : undefined,
-      steps
+      steps: JSON.parse(JSON.stringify(steps)) as WorkflowStep[],
+      ...(description ? { description } : {}),
+      ...(wsId && wsId !== 'active' ? { workspaceId: wsId } : {})
     }
 
     const res = await plugin.request('workflows.save', { workflow })
@@ -855,10 +1008,9 @@ async function executeWorkflow(wfId: string): Promise<void> {
   try {
     set(isBusy, true)
     set(statusNotice, null)
-    const res = await plugin.request('workflows.execute', {
-      workflowId: wfId,
-      workspaceId: wsId && wsId !== 'active' ? wsId : undefined
-    })
+    const payload: { workflowId: string; workspaceId?: string } = { workflowId: wfId }
+    if (wsId && wsId !== 'active') payload.workspaceId = wsId
+    const res = await plugin.request('workflows.execute', payload)
     set(statusNotice, { tone: 'success', message: res.message })
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -888,6 +1040,19 @@ export function setup(ctx: PanelContext): void {
       set(sprints, sList)
       set(epics, eList)
       set(workItems, wList)
+
+      const fallbackSprintId = resolveFallbackSprintId(sList)
+      if (!sList.some((s) => s.id === read(selectedSprintId))) {
+        set(selectedSprintId, fallbackSprintId)
+      }
+      if (!sList.some((s) => s.id === read(newItemSprintId))) {
+        set(newItemSprintId, fallbackSprintId)
+      }
+      const curDeleting = read(deletingSprintId)
+      if (curDeleting && !sList.some((s) => s.id === curDeleting)) {
+        set(deletingSprintId, null)
+        set(deleteSprintTargetId, '')
+      }
     }),
     plugin.on(
       'usage.changed',
@@ -937,6 +1102,7 @@ export default function Panel() {
   const addingSprint = read(showAddSprint)
   const addingEpic = read(showAddEpic)
   const completingSprint = read(showCompleteSprint)
+  const curDeletingSprintId = read(deletingSprintId)
   const wsList = read(workspaces)
   const wfList = read(workflows)
   const sprintList = read(sprints)
@@ -1291,15 +1457,34 @@ export default function Panel() {
                 </Row>
 
                 {/* Sprint Lifecycle Action Buttons */}
-                {activeSprint && activeSprint.status === 'active' ? (
+                {activeSprint ? (
                   <Row justify="end" gap="xs">
+                    {activeSprint.status === 'active' ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        tone="accent"
+                        onPress={() => {
+                          const next = !completingSprint
+                          set(showCompleteSprint, next)
+                          if (next) cancelDeleteSprint()
+                        }}
+                      >
+                        {completingSprint ? 'Cancel Complete' : 'Complete Sprint'}
+                      </Button>
+                    ) : null}
                     <Button
                       variant="outline"
                       size="sm"
-                      tone="accent"
-                      onPress={() => set(showCompleteSprint, !completingSprint)}
+                      tone="danger"
+                      disabled={busy}
+                      onPress={() =>
+                        curDeletingSprintId === activeSprint.id
+                          ? cancelDeleteSprint()
+                          : openDeleteSprintConfirm(activeSprint.id)
+                      }
                     >
-                      {completingSprint ? 'Cancel Complete' : 'Complete Sprint'}
+                      {curDeletingSprintId === activeSprint.id ? 'Cancel Delete' : 'Delete Sprint'}
                     </Button>
                   </Row>
                 ) : null}
@@ -1349,6 +1534,16 @@ export default function Panel() {
                     </Button>
                   </Row>
                 </Stack>
+              </Card>
+            ) : null}
+
+            {/* Delete Sprint Confirmation Subform */}
+            {activeSprint && curDeletingSprintId === activeSprint.id ? (
+              <Card
+                title={`Delete ${activeSprint.name}`}
+                description="Permanently remove this sprint and choose how to handle its work items."
+              >
+                {renderDeleteSprintConfirmBody(activeSprint, sprintItems.length, sprintList, busy)}
               </Card>
             ) : null}
 
@@ -1818,6 +2013,18 @@ export default function Panel() {
                           >
                             Open on Board
                           </Button>
+                          <IconButton
+                            icon="delete"
+                            label={`Delete ${sp.name}`}
+                            variant="ghost"
+                            tone="danger"
+                            disabled={busy}
+                            onPress={() =>
+                              curDeletingSprintId === sp.id
+                                ? cancelDeleteSprint()
+                                : openDeleteSprintConfirm(sp.id)
+                            }
+                          />
                         </Row>
                       </Row>
 
@@ -1840,6 +2047,13 @@ export default function Panel() {
                           </Text>
                         ) : null}
                       </Row>
+
+                      {curDeletingSprintId === sp.id ? (
+                        <>
+                          <Separator />
+                          {renderDeleteSprintConfirmBody(sp, spTasks.length, sprintList, busy)}
+                        </>
+                      ) : null}
                     </Stack>
                   </Card>
                 )
