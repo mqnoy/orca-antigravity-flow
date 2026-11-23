@@ -1,0 +1,88 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stablyai/orca/main/docs/schemas/plugins/orca-plugin.v2.schema.json",
+  "manifestVersion": 2,
+  "execution": "trusted-worker",
+  "id": "antigravity-flow",
+  "name": "Antigravity Flow",
+  "publisher": "mqnoy",
+  "license": "MIT",
+  "version": "1.0.0",
+  "description": "Agile workflows, multi-agent pipelines, isolated account switching, customizable personas, feature usage monitoring, and Orca Workspace Board integration for Antigravity (agy).",
+  "icon": "assets/icon.png",
+  "cover": {
+    "path": "assets/cover.png",
+    "alt": "Antigravity Flow plugin banner: agile board with account switching and quota table"
+  },
+  "screenshots": [
+    {
+      "path": "assets/screenshot.png",
+      "alt": "Antigravity Flow panel showing accounts, quotas and the agile board",
+      "caption": "Accounts, quota table, and agile board in one panel",
+      "theme": "dark"
+    }
+  ],
+  "repository": "https://github.com/mqnoy/orca-antigravity-flow",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "pluginApi": 1,
+  "main": "worker/main.mjs",
+  "contributes": {
+    "panels": [
+      {
+        "id": "antigravity-flow",
+        "title": "Antigravity Flow",
+        "icon": "bot",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "commands": [
+      {
+        "id": "antigravity.openFlow",
+        "title": "Antigravity: Open Antigravity Flow"
+      }
+    ],
+    "events": [
+      {
+        "on": "workspace.changed"
+      }
+    ],
+    "settings": [
+      {
+        "key": "accountsBaseDir",
+        "title": "Accounts base directory",
+        "description": "Base directory where Antigravity account environments are stored (defaults to ~/.gemini-accounts).",
+        "type": "string",
+        "default": "~/.gemini-accounts"
+      },
+      {
+        "key": "agyCommand",
+        "title": "Antigravity CLI command",
+        "description": "Command or binary path used to summon agy (defaults to 'agy').",
+        "type": "string",
+        "default": "agy"
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "settings:own"
+    },
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "workspace:write"
+    },
+    {
+      "kind": "terminal:send"
+    },
+    {
+      "kind": "notifications:show"
+    }
+  ]
+}
