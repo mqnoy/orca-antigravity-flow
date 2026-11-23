@@ -1,5 +1,7 @@
 # Antigravity Flow
 
+![Antigravity Flow plugin banner: agile board with account switching and quota table](assets/cover.png)
+
 An Orca plugin to orchestrate agile startup workflows, multi-agent sprint pipelines, work items, customizable personas, isolated Antigravity (`agy`) account switching, dynamic execution flags (such as `--dangerously-skip-permissions`), rich markdown startup prompts, host global skills sharing, and direct integration with Orca's **Workspace Board**.
 
 ---
