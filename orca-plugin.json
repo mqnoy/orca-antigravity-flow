@@ -6,7 +6,7 @@
   "name": "Antigravity Flow",
   "publisher": "mqnoy",
   "license": "MIT",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Agile workflows, multi-agent pipelines, isolated account switching, customizable personas, feature usage monitoring, and Orca Workspace Board integration for Antigravity (agy).",
   "icon": "assets/icon.png",
   "cover": {
