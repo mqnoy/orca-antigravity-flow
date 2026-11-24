@@ -18,6 +18,7 @@ const STORAGE_KEY_EPICS = 'agile_epics'
 const STORAGE_KEY_WORKITEMS = 'agile_workitems'
 const STORAGE_KEY_USAGE = 'account_usage_metrics'
 const STORAGE_KEY_ACTIVITIES = 'account_recent_activities'
+const STORAGE_KEY_TERMINAL_LINKS = 'terminal_workitem_links'
 
 const DEFAULT_BASE_DIR = '~/.gemini-accounts'
 const DEFAULT_AGY_CMD = 'agy'
@@ -326,6 +327,280 @@ export default async function activate(orca) {
     } catch (err) {
       orca.log(`Notice: subscribing to workspace.changed: ${err.message}`)
     }
+  }
+
+  // Listen to real-time agent status changes and auto-sync linked work items on the Agile Board
+  if (orca.events && typeof orca.events.on === 'function') {
+    try {
+      orca.events.on('agent.status.changed', async (payload) => {
+        try {
+          await drainBoardSyncQueue()
+          await syncSingleAgentStateToBoard({
+            terminalId: payload?.terminalId || null,
+            title: payload?.title || null,
+            state: payload?.mainAgent?.state || payload?.state || null,
+            outcome: payload?.mainAgent?.outcome || null,
+            workspaceId: payload?.workspaceListId || payload?.workspaceId || null
+          })
+        } catch (err) {
+          orca.log(`Notice: agent.status.changed sync error: ${err.message}`)
+        }
+      })
+    } catch (err) {
+      orca.log(`Notice: failed to subscribe to agent.status.changed: ${err.message}`)
+    }
+  }
+
+  /**
+   * Resolves the accounts base directory from plugin settings.
+   * @returns {Promise<string>}
+   */
+  async function getAccountsBaseDir() {
+    const settings = await orca.settings.get().catch(() => ({}))
+    return resolvePath(
+      typeof settings?.accountsBaseDir === 'string' && settings.accountsBaseDir.trim()
+        ? settings.accountsBaseDir
+        : DEFAULT_BASE_DIR
+    )
+  }
+
+  /**
+   * Retrieves terminalId -> workItem link map from storage.
+   * @returns {Promise<Record<string, { itemId: string, itemTitle?: string, workspaceId?: string, stepLane?: string, accountId?: string, updatedAt: number }>>}
+   */
+  async function getTerminalLinks() {
+    const raw = await orca.storage.get(STORAGE_KEY_TERMINAL_LINKS)
+    return raw && typeof raw === 'object' ? raw : {}
+  }
+
+  /**
+   * Links a spawned terminal to an Agile Work Item so agent status events sync automatically.
+   * @param {string | null | undefined} terminalId
+   * @param {{ itemId: string, itemTitle?: string, workspaceId?: string, stepLane?: string, accountId?: string }} info
+   */
+  async function linkTerminalToWorkItem(terminalId, info) {
+    if (!terminalId || !info?.itemId) return
+    const links = await getTerminalLinks()
+    const entries = Object.entries(links)
+      .sort((a, b) => (b[1]?.updatedAt || 0) - (a[1]?.updatedAt || 0))
+      .slice(0, 99)
+    const next = Object.fromEntries(entries)
+    next[terminalId] = { ...info, updatedAt: Date.now() }
+    await storageSet(STORAGE_KEY_TERMINAL_LINKS, next)
+  }
+
+  /**
+   * Extracts a work item ID from a terminal title like "[Agile: task-102] ...".
+   * @param {string | null | undefined} title
+   * @returns {string | null}
+   */
+  function parseWorkItemIdFromTitle(title) {
+    if (!title || typeof title !== 'string') return null
+    const m = title.match(/\[Agile:\s*([^\]]+)\]/i)
+    return m ? m[1].trim() : null
+  }
+
+  /**
+   * Infers the target Agile Board lane from an Orca agent state, outcome, and terminal output tail.
+   * @param {{
+   *   state?: string | null
+   *   outcome?: string | null
+   *   terminalOutput?: string
+   *   stepLane?: string | null
+   *   currentStatus?: string | null
+   * }} params
+   * @returns {{ lane: import('../src/protocol').AgileTaskStatus | null, reason: string }}
+   */
+  function inferBoardLaneFromAgentEvent({ state, outcome, terminalOutput = '', stepLane, currentStatus }) {
+    const tail = terminalOutput.toLowerCase()
+    const asksForReview =
+      /\b(ready for review|please review|for your review|request(ing)? review|code review|in review|pr ready|pull request|minta review|mohon review|siap di\s?review|butuh review|perlu review|review needed)\b/i.test(
+        tail
+      )
+    const asksForTodo =
+      /\b(moved? back to todo|needs planning|back to backlog)\b/i.test(tail)
+
+    if (asksForTodo) {
+      return { lane: 'todo', reason: 'Agent requested return to Todo' }
+    }
+    if (state === 'working') {
+      if (asksForReview && currentStatus !== 'in-review') {
+        return { lane: 'in-review', reason: 'Agent requested review in terminal' }
+      }
+      return { lane: 'in-progress', reason: 'Agent is actively working in terminal' }
+    }
+    if (state === 'waiting' || state === 'blocked') {
+      return {
+        lane: 'in-review',
+        reason: asksForReview
+          ? 'Agent requested review in terminal'
+          : `Agent is ${state} (needs review / input)`
+      }
+    }
+    if (state === 'done') {
+      if (asksForReview || stepLane === 'in-review') {
+        return { lane: 'in-review', reason: 'Agent finished work and requested review' }
+      }
+      if (outcome === 'failure' || outcome === 'cancellation' || outcome === 'interruption') {
+        return { lane: 'in-progress', reason: `Agent stopped (${outcome})` }
+      }
+      return { lane: 'completed', reason: 'Agent completed task in terminal' }
+    }
+    return { lane: null, reason: '' }
+  }
+
+  /**
+   * Processes any explicit board status updates written by agents via `team-chat.mjs board`.
+   */
+  async function drainBoardSyncQueue() {
+    const baseDir = await getAccountsBaseDir()
+    const queueFile = join(baseDir, '_board-sync-queue.jsonl')
+    const raw = await readFile(queueFile, 'utf8').catch(() => '')
+    if (!raw || !raw.trim()) return []
+
+    await writeFile(queueFile, '', 'utf8').catch(() => {})
+    const validStatuses = new Set(['todo', 'in-progress', 'in-review', 'completed'])
+    const lines = raw.split(/\r?\n/).filter((l) => l.trim())
+    const workItems = await getStoredWorkItems()
+    let modified = false
+    const changes = []
+
+    for (const line of lines) {
+      try {
+        const evt = JSON.parse(line)
+        if (!evt || !evt.itemId || !validStatuses.has(evt.status)) continue
+        const idx = workItems.findIndex((w) => w.id === evt.itemId)
+        if (idx < 0) continue
+        const prev = workItems[idx].status
+        if (prev === evt.status) continue
+        workItems[idx] = { ...workItems[idx], status: evt.status, updatedAt: Date.now() }
+        modified = true
+        changes.push({
+          itemId: workItems[idx].id,
+          title: workItems[idx].title,
+          from: prev,
+          to: evt.status,
+          reason: evt.note || 'Updated directly by agent via team-chat'
+        })
+      } catch {}
+    }
+
+    if (modified) {
+      await storageSet(STORAGE_KEY_WORKITEMS, workItems)
+      const [sprints, epics] = await Promise.all([getStoredSprints(), getStoredEpics()])
+      orca.panels.post('board.changed', {
+        sprints,
+        epics,
+        workItems,
+        lanes: ORCA_DEFAULT_BOARD_LANES
+      })
+    }
+    return changes
+  }
+
+  /**
+   * Syncs a single terminal agent's live state to its linked Agile Board Work Item.
+   * @param {{ terminalId?: string | null, title?: string | null, state?: string | null, outcome?: string | null, workspaceId?: string | null }} evt
+   */
+  async function syncSingleAgentStateToBoard(evt) {
+    if (!evt?.state) return null
+    const links = await getTerminalLinks()
+    const link = evt.terminalId ? links[evt.terminalId] : null
+    const itemId = link?.itemId || parseWorkItemIdFromTitle(evt.title)
+    if (!itemId) return null
+
+    const workItems = await getStoredWorkItems()
+    const idx = workItems.findIndex((w) => w.id === itemId)
+    if (idx < 0) return null
+    const item = workItems[idx]
+
+    let terminalOutput = ''
+    if (evt.terminalId && (evt.state === 'waiting' || evt.state === 'blocked' || evt.state === 'done')) {
+      try {
+        const readRes = await orca.host.call('terminal.read', {
+          terminalId: evt.terminalId,
+          maxLines: 45
+        })
+        if (Array.isArray(readRes?.lines)) {
+          terminalOutput = readRes.lines.join('\n')
+        }
+      } catch {
+        // terminal.read may not be granted or terminal closed; fall back to state only
+      }
+    }
+
+    const { lane, reason } = inferBoardLaneFromAgentEvent({
+      state: evt.state,
+      outcome: evt.outcome,
+      terminalOutput,
+      stepLane: link?.stepLane || null,
+      currentStatus: item.status
+    })
+    if (!lane || lane === item.status) return null
+
+    const prevStatus = item.status
+    const updated = [...workItems]
+    updated[idx] = { ...item, status: lane, updatedAt: Date.now() }
+    await storageSet(STORAGE_KEY_WORKITEMS, updated)
+
+    const [sprints, epics] = await Promise.all([getStoredSprints(), getStoredEpics()])
+    orca.panels.post('board.changed', {
+      sprints,
+      epics,
+      workItems: updated,
+      lanes: ORCA_DEFAULT_BOARD_LANES
+    })
+
+    if (link?.accountId || item.assignedAccountId) {
+      await recordAccountActivity({
+        accountId: link?.accountId || item.assignedAccountId,
+        type: 'task',
+        title: `Board Sync: ${item.title} -> ${lane}`,
+        details: reason,
+        workspaceId: evt.workspaceId || link?.workspaceId || item.workspaceId
+      }).catch(() => {})
+    }
+
+    if (lane === 'in-review' || lane === 'completed') {
+      try {
+        await orca.host.call('notifications.show', {
+          title: lane === 'in-review' ? 'Task Ready for Review' : 'Task Completed',
+          body: `"${item.title}" moved to ${lane === 'in-review' ? 'In Review' : 'Done'} (${reason})`
+        })
+      } catch {}
+    }
+
+    return { itemId: item.id, title: item.title, from: prevStatus, to: lane, reason }
+  }
+
+  /**
+   * Queries all live agents in the target workspace and syncs their status to the Agile Board.
+   * @param {string} [workspaceId]
+   */
+  async function syncAllLiveAgentsToBoard(workspaceId) {
+    const changes = await drainBoardSyncQueue()
+    try {
+      const targetWs = await resolveTargetWorkspace(workspaceId)
+      const listRes = await orca.host.call(
+        'agents.list',
+        targetWs ? { workspaceId: targetWs } : {}
+      )
+      const liveAgents = Array.isArray(listRes?.agents) ? listRes.agents : []
+      for (const ag of liveAgents) {
+        const change = await syncSingleAgentStateToBoard({
+          terminalId: ag.terminalId || null,
+          title: ag.title || null,
+          state: ag.state || null,
+          outcome: null,
+          workspaceId: targetWs || null
+        })
+        if (change) changes.push(change)
+      }
+    } catch (err) {
+      orca.log(`Notice: agents.list sync skipped: ${err.message}`)
+    }
+    const workItems = await getStoredWorkItems()
+    return { syncedCount: changes.length, changes, workItems }
   }
 
   /**
@@ -698,6 +973,50 @@ export default async function activate(orca) {
   }
 
   /**
+   * Atomically reconciles every configured account's email with its actual authenticated
+   * Google OAuth credential file (avoids concurrent storage overwrites and stale emails).
+   * @param {import('../src/protocol').AntigravityAccount[]} accounts
+   * @param {boolean} [broadcast]
+   * @returns {Promise<import('../src/protocol').AntigravityAccount[]>}
+   */
+  async function syncAccountsEmailsFromAuth(accounts, broadcast = false) {
+    if (!Array.isArray(accounts) || accounts.length === 0) return accounts
+    const authResults = await Promise.all(
+      accounts.map((acc) => checkAccountAuthStatus(acc).catch(() => ({ loggedIn: false, email: null })))
+    )
+
+    let changed = false
+    const updated = accounts.map((acc, idx) => {
+      const auth = authResults[idx]
+      if (auth?.loggedIn && auth.email) {
+        if (acc.email !== auth.email) {
+          changed = true
+          return { ...acc, email: auth.email }
+        }
+        return acc
+      }
+      if (!auth?.loggedIn && acc.email) {
+        changed = true
+        const copy = { ...acc }
+        delete copy.email
+        return copy
+      }
+      return acc
+    })
+
+    if (changed) {
+      await storageSet(STORAGE_KEY_ACCOUNTS, updated)
+      if (broadcast) {
+        orca.panels.post('accounts.changed', {
+          accounts: updated,
+          activeId: await getActiveAccountId()
+        })
+      }
+    }
+    return updated
+  }
+
+  /**
    * Fetches real-time quota and remaining token limits for an Antigravity account using agy -p /usage.
    * @param {import('../src/protocol').AntigravityAccount} account
    * @param {boolean} forceRefresh
@@ -731,23 +1050,9 @@ export default async function activate(orca) {
       return notLoggedInResult
     }
 
-    // Sync detected Google account email if not yet stored
+    // Keep in-memory account email aligned with auth status (persisted atomically via syncAccountsEmailsFromAuth)
     if (authStatus.email && account.email !== authStatus.email) {
-      try {
-        account.email = authStatus.email
-        const allAccounts = await getStoredAccounts()
-        const idx = allAccounts.findIndex((a) => a.id === account.id)
-        if (idx >= 0) {
-          allAccounts[idx] = { ...allAccounts[idx], email: authStatus.email }
-          await storageSet(STORAGE_KEY_ACCOUNTS, allAccounts)
-          orca.panels.post('accounts.changed', {
-            accounts: allAccounts,
-            activeId: await getActiveAccountId()
-          })
-        }
-      } catch (err) {
-        orca.log(`Notice: updating account email: ${err.message}`)
-      }
+      account.email = authStatus.email
     }
 
     try {
@@ -1200,7 +1505,8 @@ export default async function activate(orca) {
 
   // --- 1. ACCOUNTS HANDLERS ---
   orca.panels.handle('accounts.list', async () => {
-    const accounts = await getStoredAccounts()
+    const stored = await getStoredAccounts()
+    const accounts = await syncAccountsEmailsFromAuth(stored, false)
     const activeId = await getActiveAccountId()
     return {
       accounts,
@@ -1568,8 +1874,359 @@ export default async function activate(orca) {
     return { ok: true, workflows: updated }
   })
 
+  /**
+   * Extracts a concise specialty/description from a bot's SOUL.md.
+   * @param {string | null} soulText
+   * @returns {string | null}
+   */
+  function extractSoulSpecialty(soulText) {
+    if (!soulText || typeof soulText !== 'string') return null
+    const lines = soulText.split(/\r?\n/)
+    const collected = []
+    for (const raw of lines) {
+      const line = raw.trim()
+      if (!line) {
+        if (collected.length > 0) break
+        continue
+      }
+      if (line.startsWith('#')) {
+        if (collected.length > 0) break
+        continue
+      }
+      collected.push(line)
+    }
+    const joined = collected.join(' ').trim()
+    if (!joined) return null
+    return joined.length > 160 ? `${joined.slice(0, 157)}...` : joined
+  }
+
+  /**
+   * Discovers local Orca Bots stored under ~/.orca/bots.
+   * @returns {Promise<{ bots: import('../src/protocol').OrcaBotSummary[], botsDir: string }>}
+   */
+  async function discoverLocalOrcaBots() {
+    const botsDir = join(homedir(), '.orca', 'bots')
+    const bots = []
+    try {
+      const entries = await readdir(botsDir, { withFileTypes: true }).catch(() => [])
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.name.startsWith('.')) continue
+        const homeDir = join(botsDir, entry.name)
+        const botJsonPath = join(homeDir, 'bot.json')
+        try {
+          const raw = await readFile(botJsonPath, 'utf8')
+          const parsed = JSON.parse(raw)
+          if (!parsed || typeof parsed !== 'object') continue
+          const soulText = await readFile(join(homeDir, 'SOUL.md'), 'utf8').catch(() => null)
+          bots.push({
+            id: typeof parsed.id === 'string' && parsed.id ? parsed.id : entry.name,
+            name: typeof parsed.name === 'string' && parsed.name ? parsed.name : entry.name,
+            agent: typeof parsed.agent === 'string' && parsed.agent ? parsed.agent : 'unknown',
+            specialty: extractSoulSpecialty(soulText),
+            homeDir
+          })
+        } catch {
+          // Skip folders without valid bot.json
+        }
+      }
+    } catch {
+      // ~/.orca/bots may not exist yet
+    }
+    bots.sort((a, b) => a.name.localeCompare(b.name))
+    return { bots, botsDir }
+  }
+
+  /**
+   * Resolves a workflow goal target (Sprint, Epic, or Work Item) into structured Markdown context.
+   * @param {{
+   *   goalType?: string
+   *   goalId?: string
+   *   customGoal?: string
+   *   wf: import('../src/protocol').ProjectWorkflow
+   *   sprints: import('../src/protocol').AgileSprint[]
+   *   epics: import('../src/protocol').AgileEpic[]
+   *   workItems: import('../src/protocol').AgileWorkItem[]
+   * }} params
+   */
+  function buildWorkflowGoalContext({ goalType, goalId, customGoal, wf, sprints, epics, workItems }) {
+    const resolvedType =
+      goalType ||
+      wf.goalTarget?.type ||
+      (wf.sprintId ? 'sprint' : wf.epicId ? 'epic' : 'none')
+    const resolvedId =
+      goalId ||
+      wf.goalTarget?.id ||
+      (resolvedType === 'sprint' ? wf.sprintId : resolvedType === 'epic' ? wf.epicId : undefined)
+    const extraGoal = (customGoal || wf.goalTarget?.customGoal || '').trim()
+
+    let title = wf.name
+    const lines = [`# Team Mission: ${wf.name}`]
+    if (wf.description) {
+      lines.push('', wf.description)
+    }
+
+    if (resolvedType === 'sprint' && resolvedId) {
+      const sprint = sprints.find((s) => s.id === resolvedId)
+      if (sprint) {
+        title = `Sprint: ${sprint.name}`
+        lines.push('', `## Goal Target: Sprint — ${sprint.name}`)
+        lines.push(`- **Status:** ${sprint.status}`)
+        if (sprint.goal) lines.push(`- **Sprint Goal:** ${sprint.goal}`)
+        if (sprint.targetPoints) lines.push(`- **Target Points:** ${sprint.targetPoints} pts`)
+        const sprintItems = workItems.filter((w) => w.sprintId === sprint.id)
+        if (sprintItems.length > 0) {
+          lines.push('', `### Sprint Work Items (${sprintItems.length})`)
+          for (const item of sprintItems) {
+            const epic = epics.find((e) => e.id === item.epicId)
+            lines.push(
+              `- [${item.status}] **${item.title}**${epic ? ` (Epic: ${epic.name})` : ''}${item.storyPoints ? ` [${item.storyPoints} pts]` : ''}${item.assignedPersona ? ` — Assigned: ${item.assignedPersona}` : ''}`
+            )
+            if (item.description) {
+              lines.push(`  - ${item.description}`)
+            }
+          }
+        }
+      }
+    } else if (resolvedType === 'epic' && resolvedId) {
+      const epic = epics.find((e) => e.id === resolvedId)
+      if (epic) {
+        title = `Epic: ${epic.name}`
+        lines.push('', `## Goal Target: Epic — ${epic.name}`)
+        if (epic.status) lines.push(`- **Status:** ${epic.status}`)
+        if (epic.description) lines.push(`- **Description:** ${epic.description}`)
+        const epicItems = workItems.filter((w) => w.epicId === epic.id)
+        if (epicItems.length > 0) {
+          lines.push('', `### Epic Work Items (${epicItems.length})`)
+          for (const item of epicItems) {
+            lines.push(
+              `- [${item.status}] **${item.title}**${item.storyPoints ? ` [${item.storyPoints} pts]` : ''}${item.assignedPersona ? ` — Assigned: ${item.assignedPersona}` : ''}`
+            )
+            if (item.description) {
+              lines.push(`  - ${item.description}`)
+            }
+          }
+        }
+      }
+    } else if (resolvedType === 'workitem' && resolvedId) {
+      const item = workItems.find((w) => w.id === resolvedId)
+      if (item) {
+        const epic = epics.find((e) => e.id === item.epicId)
+        const sprint = sprints.find((s) => s.id === item.sprintId)
+        title = `Work Item: ${item.title}`
+        lines.push('', `## Goal Target: Work Item — ${item.title}`)
+        lines.push(`- **Status:** ${item.status}`)
+        if (sprint) lines.push(`- **Sprint:** ${sprint.name}${sprint.goal ? ` (${sprint.goal})` : ''}`)
+        if (epic) lines.push(`- **Epic:** ${epic.name}`)
+        if (item.storyPoints) lines.push(`- **Story Points:** ${item.storyPoints}`)
+        if (item.assignedPersona) lines.push(`- **Assigned Persona:** ${item.assignedPersona}`)
+        if (item.description) lines.push('', '### Work Item Details', item.description)
+      }
+    }
+
+    if (extraGoal) {
+      lines.push('', '## Additional Mission Instructions', extraGoal)
+    }
+
+    return { title, summaryMarkdown: lines.join('\n') }
+  }
+
+  /**
+   * Builds a zero-dependency Node.js team communication CLI script inside the run directory
+   * so agents and bots can reliably message each other via THREAD.md, per-step inboxes,
+   * and (when available) `orca orchestration send`.
+   * @param {string} runDir
+   * @returns {string}
+   */
+  function buildTeamChatScriptSource(runDir, boardSyncQueueFile = '') {
+    return `#!/usr/bin/env node
+import { execFile } from 'node:child_process'
+import { appendFile, readFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { promisify } from 'node:util'
+
+const execFileAsync = promisify(execFile)
+const RUN_DIR = ${JSON.stringify(runDir)}
+const BOARD_QUEUE_FILE = ${JSON.stringify(boardSyncQueueFile)}
+const PEERS_FILE = join(RUN_DIR, 'PEERS.json')
+const THREAD_FILE = join(RUN_DIR, 'THREAD.md')
+
+function parseArgs(argv) {
+  const args = { _: [] }
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i]
+    if (token.startsWith('--')) {
+      const key = token.slice(2)
+      const next = argv[i + 1]
+      if (next && !next.startsWith('--')) {
+        args[key] = next
+        i++
+      } else {
+        args[key] = 'true'
+      }
+    } else {
+      args._.push(token)
+    }
+  }
+  return args
+}
+
+async function loadPeers() {
+  try {
+    return JSON.parse(await readFile(PEERS_FILE, 'utf8'))
+  } catch {
+    return { workflow: '', mode: 'auto-agents', peers: [] }
+  }
+}
+
+async function tryOrcaSend(target, type, subject, body) {
+  if (!target) return false
+  try {
+    await execFileAsync(
+      'orca',
+      ['orchestration', 'send', '--to', target, '--type', type, '--subject', subject, '--body', body],
+      { timeout: 8000 }
+    )
+    return true
+  } catch {
+    return false
+  }
+}
+
+const cmd = process.argv[2] || 'peers'
+const args = parseArgs(process.argv.slice(3))
+const data = await loadPeers()
+const peers = Array.isArray(data.peers) ? data.peers : []
+
+if (cmd === 'peers') {
+  console.log(\`Team: \${data.workflow} (mode: \${data.mode})\`)
+  for (const p of peers) {
+    const target = p.botName ? \`bot:\${p.botName}\` : p.terminalId || 'pending'
+    console.log(\`  #\${p.step} [\${p.persona}] target=\${target} inbox=\${p.inboxFile || '-'}\`)
+  }
+  process.exit(0)
+}
+
+if (cmd === 'read') {
+  const stepNum = Number(args.step || 0)
+  const me = peers.find((p) => p.step === stepNum)
+  if (me?.inboxFile) {
+    const inbox = await readFile(me.inboxFile, 'utf8').catch(() => '')
+    console.log('=== YOUR INBOX ===\\n' + inbox)
+  }
+  const thread = await readFile(THREAD_FILE, 'utf8').catch(() => '')
+  const tail = thread.split(/\\r?\\n/).slice(-80).join('\\n')
+  console.log('\\n=== SHARED THREAD (LATEST) ===\\n' + tail)
+  process.exit(0)
+}
+
+if (cmd === 'send') {
+  const fromStep = args.from || 'team'
+  const fromPeer = peers.find((p) => String(p.step) === String(fromStep))
+  const fromLabel = fromPeer ? \`Step #\${fromPeer.step} (\${fromPeer.persona})\` : String(fromStep)
+  const toRaw = String(args.to || 'all')
+  const type = String(args.type || 'status')
+  const subject = String(args.subject || \`[\${type}] from \${fromLabel}\`)
+  const body = String(args.msg || args.body || '').trim()
+  if (!body) {
+    console.error('Missing --msg "<message>"')
+    process.exit(1)
+  }
+
+  const ts = new Date().toISOString()
+  const recipients =
+    toRaw === 'all'
+      ? peers.filter((p) => !fromPeer || p.step !== fromPeer.step)
+      : peers.filter(
+          (p) =>
+            String(p.step) === toRaw ||
+            (p.botName && (\`bot:\${p.botName}\`.toLowerCase() === toRaw.toLowerCase() || p.botName.toLowerCase() === toRaw.toLowerCase())) ||
+            (p.terminalId && p.terminalId === toRaw) ||
+            p.persona.toLowerCase().includes(toRaw.toLowerCase())
+        )
+
+  const toLabel =
+    toRaw === 'all'
+      ? 'ALL TEAMMATES'
+      : recipients.length > 0
+        ? recipients.map((r) => \`Step #\${r.step} (\${r.persona})\`).join(', ')
+        : toRaw
+
+  const entry = \`\\n### [\${ts}] \${fromLabel} -> \${toLabel} (\${type.toUpperCase()})\\n**\${subject}**\\n\${body}\\n\`
+  await appendFile(THREAD_FILE, entry, 'utf8')
+
+  let mailDelivered = 0
+  for (const r of recipients) {
+    if (r.inboxFile) {
+      await appendFile(r.inboxFile, entry, 'utf8').catch(() => {})
+    }
+    const mailTarget = r.botName ? \`bot:\${r.botName}\` : r.terminalId || null
+    if (mailTarget && (await tryOrcaSend(mailTarget, type, subject, body))) {
+      mailDelivered++
+    }
+  }
+  if (recipients.length === 0 && toRaw.startsWith('bot:')) {
+    if (await tryOrcaSend(toRaw, type, subject, body)) mailDelivered++
+  }
+
+  console.log(\`Posted to THREAD.md + \${recipients.length} inbox(es) (orca mail delivered: \${mailDelivered}).\`)
+  process.exit(0)
+}
+
+if (cmd === 'board') {
+  const itemId = String(args.item || '').trim()
+  const status = String(args.status || '').trim()
+  const note = String(args.note || args.msg || '').trim()
+  const valid = ['todo', 'in-progress', 'in-review', 'completed']
+  if (!itemId || !valid.includes(status)) {
+    console.error('Usage: node team-chat.mjs board --item <itemId> --status todo|in-progress|in-review|completed [--note "..."]')
+    process.exit(1)
+  }
+  if (!BOARD_QUEUE_FILE) {
+    console.error('Board sync queue file not configured for this run.')
+    process.exit(1)
+  }
+  const line = JSON.stringify({ itemId, status, note, ts: Date.now() }) + '\\n'
+  await appendFile(BOARD_QUEUE_FILE, line, 'utf8')
+  const entry = \`\\n### [\${new Date().toISOString()}] BOARD SYNC -> \${itemId} = \${status.toUpperCase()}\\n\${note || 'Status updated by agent'}\\n\`
+  await appendFile(THREAD_FILE, entry, 'utf8').catch(() => {})
+  console.log(\`Queued board status update: \${itemId} -> \${status}\`)
+  process.exit(0)
+}
+
+console.log('Usage: node team-chat.mjs <peers|read --step N|send --from N --to N|all|bot:name --type question|handoff|status --subject "..." --msg "..."|board --item ID --status todo|in-progress|in-review|completed>')
+`
+  }
+
+  /**
+   * Resolves a local Orca Bot for a workflow step by explicit mapping or persona/name heuristic.
+   * @param {import('../src/protocol').WorkflowStep} step
+   * @param {import('../src/protocol').AntigravityAccount | undefined} account
+   * @param {import('../src/protocol').OrcaBotSummary[]} bots
+   */
+  function matchOrcaBotForStep(step, account, bots) {
+    if (!bots || bots.length === 0) return null
+    if (step.botName && step.botName.trim()) {
+      const target = step.botName.trim().toLowerCase()
+      return (
+        bots.find((b) => b.name.toLowerCase() === target || b.id.toLowerCase() === target) || null
+      )
+    }
+    const candidates = [account?.id, account?.name, account?.personaName, step.role, step.name]
+      .filter((v) => typeof v === 'string' && v.trim())
+      .map((v) => v.trim().toLowerCase())
+    for (const c of candidates) {
+      const exact = bots.find((b) => b.name.toLowerCase() === c)
+      if (exact) return exact
+    }
+    return null
+  }
+
+  orca.panels.handle('bots.list', async () => {
+    return await discoverLocalOrcaBots()
+  })
+
   orca.panels.handle('workflows.execute', async (params = {}) => {
-    const { workflowId, workspaceId } = params || {}
+    const { workflowId, workspaceId, mode, goalType, goalId, customGoal } = params || {}
     if (typeof workflowId !== 'string' || !workflowId.trim()) {
       throw new Error('Workflow ID is required')
     }
@@ -1586,14 +2243,315 @@ export default async function activate(orca) {
       throw new Error(`Workflow "${wf.name}" contains no agent steps`)
     }
 
-    const accounts = await getStoredAccounts()
+    const executionMode =
+      mode === 'orca-bots' || mode === 'auto-agents'
+        ? mode
+        : wf.executionMode === 'orca-bots'
+          ? 'orca-bots'
+          : 'auto-agents'
+
+    const [accounts, sprints, epics, workItems, settings] = await Promise.all([
+      getStoredAccounts(),
+      getStoredSprints(),
+      getStoredEpics(),
+      getStoredWorkItems(),
+      orca.settings.get().catch(() => ({}))
+    ])
+
+    const baseDir = resolvePath(
+      typeof settings?.accountsBaseDir === 'string' && settings.accountsBaseDir.trim()
+        ? settings.accountsBaseDir
+        : DEFAULT_BASE_DIR
+    )
+    const goalCtx = buildWorkflowGoalContext({
+      goalType,
+      goalId,
+      customGoal,
+      wf,
+      sprints,
+      epics,
+      workItems
+    })
+    const boardSyncQueueFile = join(baseDir, '_board-sync-queue.jsonl')
+    const runId = `${slugify(wf.id)}-${Date.now()}`
+
+    // =========================================================================
+    // MODE 2: SEMI-AUTO WITH ORCA BOTS (auto-routed peer handoffs + shared thread)
+    // =========================================================================
+    if (executionMode === 'orca-bots') {
+      const { bots } = await discoverLocalOrcaBots()
+      if (bots.length === 0) {
+        throw new Error(
+          'No Orca Bots found in ~/.orca/bots. Create at least one bot in Orca first, or switch to 100% Auto Agents mode.'
+        )
+      }
+
+      const runDir = join(baseDir, '_bot-runs', runId)
+      const inboxDir = join(runDir, 'inbox')
+      await mkdir(inboxDir, { recursive: true })
+      const goalFile = join(runDir, 'GOAL.md')
+      const rosterFile = join(runDir, 'ROSTER.md')
+      const threadFile = join(runDir, 'THREAD.md')
+      const peersFile = join(runDir, 'PEERS.json')
+      const chatScriptFile = join(runDir, 'team-chat.mjs')
+
+      const resolvedSteps = wf.steps.map((step, idx) => {
+        const account = accounts.find((a) => a.id === step.accountId) || accounts[0]
+        const exactBot = matchOrcaBotForStep(step, account, bots)
+        // Default auto-assignment: round-robin across available local bots so default workflows work out-of-the-box
+        const bot = exactBot || bots[idx % bots.length]
+        const autoAssigned = !exactBot
+        const personaLabel = account?.personaName || step.role || step.name
+        const stepSlug = `step-${idx + 1}-${slugify(step.name)}`
+        const inboxFile = join(inboxDir, `${stepSlug}.md`)
+        return { index: idx + 1, step, account, bot, autoAssigned, personaLabel, stepSlug, inboxFile }
+      })
+
+      const missingDedicated = resolvedSteps.filter((r) => r.autoAssigned)
+
+      // Group assigned steps by unique bot so each bot gets a personalized kickoff with all its peers
+      const botGroups = []
+      const botGroupMap = new Map()
+      for (const entry of resolvedSteps) {
+        await writeFile(
+          entry.inboxFile,
+          `# Inbox for Step #${entry.index} ${entry.step.name} (bot:${entry.bot.name} — ${entry.personaLabel})\n`,
+          'utf8'
+        )
+        let group = botGroupMap.get(entry.bot.id)
+        if (!group) {
+          group = { bot: entry.bot, entries: [] }
+          botGroupMap.set(entry.bot.id, group)
+          botGroups.push(group)
+        }
+        group.entries.push(entry)
+      }
+
+      const rosterLines = resolvedSteps.map(
+        (r) =>
+          `- **Step #${r.index}: ${r.step.name}** -> \`bot:${r.bot.name}\`${r.autoAssigned ? ' _(auto-assigned)_' : ''} | Persona: **${r.personaLabel}**${r.step.statusLane ? ` | Lane: \`${r.step.statusLane}\`` : ''}`
+      )
+
+      const rosterMarkdown = [`# Team Bot Roster — ${wf.name}`, '', ...rosterLines].join('\n')
+      await writeFile(goalFile, `${goalCtx.summaryMarkdown}\n`, 'utf8')
+      await writeFile(rosterFile, `${rosterMarkdown}\n`, 'utf8')
+      await writeFile(
+        threadFile,
+        `# Bot Team Discussion Thread — ${wf.name}\n> Goal: ${goalCtx.title}\n> Started: ${new Date().toISOString()}\n\n`,
+        'utf8'
+      )
+      await writeFile(chatScriptFile, buildTeamChatScriptSource(runDir, boardSyncQueueFile), 'utf8')
+      await writeFile(
+        peersFile,
+        JSON.stringify(
+          {
+            workflow: wf.name,
+            goal: goalCtx.title,
+            mode: 'orca-bots',
+            peers: resolvedSteps.map((r) => ({
+              step: r.index,
+              name: r.step.name,
+              persona: r.personaLabel,
+              botName: r.bot.name,
+              botId: r.bot.id,
+              autoAssigned: r.autoAssigned,
+              inboxFile: r.inboxFile
+            }))
+          },
+          null,
+          2
+        ),
+        'utf8'
+      )
+
+      const stepInstructions = resolvedSteps
+        .map((r) =>
+          [
+            `### Step #${r.index}: ${r.step.name} [bot:${r.bot.name}]`,
+            `- **Persona:** ${r.personaLabel}`,
+            ...(r.step.statusLane ? [`- **Board Lane:** ${r.step.statusLane}`] : []),
+            ...(r.account?.personaInstructions ? ['', r.account.personaInstructions.trim()] : []),
+            ...(r.step.prompt?.trim() ? ['', r.step.prompt.trim()] : [])
+          ].join('\n')
+        )
+        .join('\n\n')
+
+      const offerSection =
+        missingDedicated.length > 0
+          ? [
+              '',
+              '## Optional: Propose Dedicated Persona Bots',
+              'Some steps were auto-assigned to existing bots. If the owner wants dedicated bots per persona, propose them with:',
+              ...missingDedicated.map((m) => {
+                const suggestedName = slugify(m.step.botName || m.account?.id || m.step.name)
+                const purpose = `${m.personaLabel} for ${wf.name}`
+                return `- \`orca bot create --offer --name ${JSON.stringify(suggestedName)} --purpose ${JSON.stringify(purpose)}\``
+              })
+            ].join('\n')
+          : ''
+
+      const isWin = process.platform === 'win32'
+      const subject = `[Team Workflow: ${wf.name}] ${goalCtx.title}`
+      const dispatchLines = []
+
+      for (let gIdx = 0; gIdx < botGroups.length; gIdx++) {
+        const group = botGroups[gIdx]
+        const isLead = gIdx === 0
+        const otherBots = botGroups.filter((bg) => bg.bot.id !== group.bot.id)
+        const myRoles = group.entries.map((e) => `#${e.index} ${e.step.name} (${e.personaLabel})`).join(', ')
+        const botKickoffPath = join(runDir, `kickoff-${slugify(group.bot.name)}.md`)
+
+        const peerCommands =
+          otherBots.length > 0
+            ? otherBots.map((ob) => {
+                const obRoles = ob.entries.map((e) => e.personaLabel).join(', ')
+                return `- **Talk to \`bot:${ob.bot.name}\` (${obRoles}):**\n  - Question: \`orca orchestration send --to bot:${ob.bot.name} --type question --subject "<topic>" --body "<question>"\`\n  - Handoff: \`orca orchestration send --to bot:${ob.bot.name} --type handoff --subject "<task>" --body "<deliverable & next steps>"\`\n  - Status: \`orca orchestration send --to bot:${ob.bot.name} --type status --subject "<update>" --body "<progress>"\``
+              })
+            : ['- You are the sole bot assigned to all steps; execute them in sequence and log progress in the shared thread.']
+
+        const botKickoffMarkdown = [
+          `# Your Bot Assignment: \`bot:${group.bot.name}\` (${isLead ? 'Team Lead' : 'Team Member'})`,
+          `- **Assigned Steps & Personas:** ${myRoles}`,
+          `- **Shared Thread:** \`${threadFile}\``,
+          `- **Team Chat CLI:** \`node ${JSON.stringify(chatScriptFile)} send --from ${group.entries[0].index} --to all --type status --subject "..." --msg "..."\``,
+          '',
+          goalCtx.summaryMarkdown,
+          '',
+          rosterMarkdown,
+          '',
+          '## Direct Bot-to-Bot Communication (Enabled by Default)',
+          'Actively coordinate with your teammate bots until the goal is complete:',
+          ...peerCommands,
+          ...(isLead ? [offerSection] : []),
+          '',
+          '## Full Workflow Step Playbook',
+          stepInstructions
+        ].join('\n')
+
+        await writeFile(botKickoffPath, botKickoffMarkdown, 'utf8')
+
+        const target = `bot:${group.bot.name}`
+        const botSubject = isLead ? subject : `[Teammate Handoff] ${subject}`
+        dispatchLines.push(
+          `orca orchestration send --to ${escapeShellArg(target, isWin)} --type handoff --subject ${escapeShellArg(botSubject, isWin)} --body-file ${escapeShellArg(botKickoffPath, isWin)}`
+        )
+      }
+
+      const dispatchCmd = dispatchLines.join(' && ')
+      await orca.host.call('terminal.create', {
+        workspaceId: targetWorkspaceId,
+        title: clampTerminalTitle(
+          `[Bot Team Dispatch: ${wf.name}] -> ${botGroups.map((g) => `bot:${g.bot.name}`).join(', ')}`
+        ),
+        command: dispatchCmd
+      })
+
+      for (const group of botGroups) {
+        const firstEntry = group.entries[0]
+        if (firstEntry?.account) {
+          await recordAccountActivity({
+            accountId: firstEntry.account.id,
+            type: 'workflow',
+            title: `Bot Dispatch: bot:${group.bot.name} (${firstEntry.step.name})`,
+            details: `Pipeline: "${wf.name}" -> ${goalCtx.title}`,
+            workspaceId: targetWorkspaceId
+          })
+        }
+      }
+
+      const dispatchedNames = botGroups.map((g) => g.bot.name)
+      const autoAssignedLabels = missingDedicated.map((m) => m.personaLabel)
+
+      try {
+        await orca.host.call('notifications.show', {
+          title: 'Orca Bot Team Dispatched',
+          body: `Dispatched "${wf.name}" to ${dispatchedNames.map((n) => `bot:${n}`).join(', ')}`
+        })
+      } catch {}
+
+      return {
+        ok: true,
+        mode: 'orca-bots',
+        startedSteps: resolvedSteps.length,
+        dispatchedBots: dispatchedNames,
+        missingBots: autoAssignedLabels,
+        coordinationDir: runDir,
+        message:
+          autoAssignedLabels.length > 0
+            ? `Dispatched "${wf.name}" to Orca Bots (${dispatchedNames.map((n) => `bot:${n}`).join(', ')}) with peer-to-peer handoffs! (${autoAssignedLabels.length} step(s) auto-assigned to existing bots).`
+            : `Dispatched "${wf.name}" to Orca Bots (${dispatchedNames.map((n) => `bot:${n}`).join(', ')}) with peer-to-peer handoffs!`
+      }
+    }
+
+    // =========================================================================
+    // MODE 1: 100% AUTO AGENTS (agy persona terminals + live PEERS.json + team-chat.mjs)
+    // =========================================================================
     const agyCmd = await getAgyExecutable()
+    const runDir = join(baseDir, '_team-runs', runId)
+    const inboxDir = join(runDir, 'inbox')
+    await mkdir(inboxDir, { recursive: true })
+
+    const resolvedSteps = wf.steps.map((step, idx) => {
+      const account = accounts.find((a) => a.id === step.accountId) || accounts[0]
+      const personaLabel = account?.personaName || step.role || step.name
+      const stepSlug = `step-${idx + 1}-${slugify(step.name)}`
+      const inboxFile = join(inboxDir, `${stepSlug}.md`)
+      return {
+        index: idx + 1,
+        step,
+        account,
+        personaLabel,
+        stepSlug,
+        inboxFile,
+        terminalId: null,
+        title: ''
+      }
+    })
+
+    const goalFile = join(runDir, 'GOAL.md')
+    const rosterFile = join(runDir, 'ROSTER.md')
+    const threadFile = join(runDir, 'THREAD.md')
+    const peersFile = join(runDir, 'PEERS.json')
+    const chatScriptFile = join(runDir, 'team-chat.mjs')
+
+    await writeFile(goalFile, `${goalCtx.summaryMarkdown}\n`, 'utf8')
+    await writeFile(chatScriptFile, buildTeamChatScriptSource(runDir, boardSyncQueueFile), 'utf8')
+
+    const buildRosterMd = () =>
+      [
+        `# Team Roster — ${wf.name}`,
+        '',
+        ...resolvedSteps.map(
+          (r) =>
+            `- **#${r.index} ${r.step.name}** | Persona: **${r.personaLabel}** | Account: \`${r.account?.name || r.step.accountId}\` | Lane: \`${r.step.statusLane || 'in-progress'}\`${r.terminalId ? ` | Terminal: \`${r.terminalId}\`` : ''} | Inbox: \`${r.inboxFile}\``
+        )
+      ].join('\n')
+
+    const rosterMarkdown = buildRosterMd()
+    await writeFile(rosterFile, `${rosterMarkdown}\n`, 'utf8')
+
+    const initialThread = [
+      `# Team Discussion Thread — ${wf.name}`,
+      `> Goal: ${goalCtx.title}`,
+      `> Started: ${new Date().toISOString()}`,
+      '',
+      'Post status updates, questions, review feedback, and handoffs below with `[#Step PersonaName]` headers.',
+      ''
+    ].join('\n')
+    await writeFile(threadFile, initialThread, 'utf8')
+
     let startedCount = 0
 
-    for (let i = 0; i < wf.steps.length; i++) {
-      const step = wf.steps[i]
-      const account = accounts.find((a) => a.id === step.accountId) || accounts[0]
+    for (let i = 0; i < resolvedSteps.length; i++) {
+      const entry = resolvedSteps[i]
+      const { step, account, personaLabel, inboxFile } = entry
       if (!account) continue
+
+      await writeFile(
+        inboxFile,
+        `# Inbox for #${entry.index} ${step.name} (${personaLabel})\n\n_Teammates can send direct questions or handoffs here._\n`,
+        'utf8'
+      )
 
       await mkdir(account.home, { recursive: true })
       await mkdir(account.geminiHome, { recursive: true })
@@ -1601,14 +2559,49 @@ export default async function activate(orca) {
         await linkGlobalSkillsToAccount(account.geminiHome)
       }
 
-      let promptFile = null
-      if (step.prompt && step.prompt.trim()) {
-        promptFile = join(account.home, `workflow-${wf.id}-step-${i + 1}.md`)
-        try {
-          await writeFile(promptFile, step.prompt.trim(), 'utf8')
-        } catch {
-          promptFile = null
-        }
+      const nextEntry = resolvedSteps[i + 1] || null
+      const prevEntry = resolvedSteps[i - 1] || null
+
+      const enrichedPrompt = [
+        `# You Are: ${personaLabel} (Step #${entry.index} — ${step.name})`,
+        ...(account.personaInstructions ? ['', account.personaInstructions.trim()] : []),
+        '',
+        goalCtx.summaryMarkdown,
+        '',
+        rosterMarkdown,
+        '',
+        '## Team Collaboration & Communication Protocol (Enabled by Default)',
+        'You are part of an automated multi-persona team running in parallel Orca terminals. Communicate proactively with your teammates using the built-in team chat tool:',
+        `- **See live teammate terminals & peers:** \`node ${JSON.stringify(chatScriptFile)} peers\``,
+        `- **Read your inbox + latest team thread:** \`node ${JSON.stringify(chatScriptFile)} read --step ${entry.index}\``,
+        `- **Message a specific teammate (e.g. Step #${nextEntry ? nextEntry.index : prevEntry ? prevEntry.index : 1}):**`,
+        `  \`node ${JSON.stringify(chatScriptFile)} send --from ${entry.index} --to ${nextEntry ? nextEntry.index : prevEntry ? prevEntry.index : 'all'} --type ${nextEntry ? 'handoff' : 'question'} --subject "<topic>" --msg "<details>"\``,
+        `- **Broadcast update to the whole team:**`,
+        `  \`node ${JSON.stringify(chatScriptFile)} send --from ${entry.index} --to all --type status --subject "<update>" --msg "<progress>"\``,
+        `- **Shared Files:** Goal=\`${goalFile}\` | Roster=\`${rosterFile}\` | Thread=\`${threadFile}\` | Your Inbox=\`${inboxFile}\``,
+        ...(prevEntry
+          ? [
+              `- **Upstream Teammate:** Step #${prevEntry.index} (${prevEntry.personaLabel}) — run \`read --step ${entry.index}\` to check their handoff, or send them a \`--type question\` with \`--to ${prevEntry.index}\`.`
+            ]
+          : []),
+        ...(nextEntry
+          ? [
+              `- **Next Handoff Target:** Step #${nextEntry.index} (${nextEntry.personaLabel}) — when your deliverable is ready, send them a \`--type handoff\` with \`--to ${nextEntry.index}\`.`
+            ]
+          : [
+              `- **Final Verification Role:** Check \`read --step ${entry.index}\` and verify all prior steps' deliverables before posting final completion to \`--to all\`.`
+            ]),
+        '- Note: `team-chat.mjs` automatically logs to `THREAD.md` + teammate inboxes AND forwards via `orca orchestration send` to live peer terminals/bots whenever available.',
+        '',
+        '## Your Step Instructions',
+        step.prompt?.trim() || `Execute your responsibilities as ${personaLabel} toward the goal above.`
+      ].join('\n')
+
+      let promptFile = join(account.home, `workflow-${wf.id}-step-${i + 1}.md`)
+      try {
+        await writeFile(promptFile, enrichedPrompt, 'utf8')
+      } catch {
+        promptFile = null
       }
 
       const flags = [...(account.flags || [])]
@@ -1619,41 +2612,94 @@ export default async function activate(orca) {
         agyCmd,
         flags,
         customFlags,
-        prompt: step.prompt,
+        prompt: enrichedPrompt,
         promptFile
       })
 
-      const personaLabel = account.personaName ? ` [${account.personaName}]` : ''
+      const personaBadge = account.personaName ? ` [${account.personaName}]` : ''
       const laneLabel = step.statusLane ? ` [${step.statusLane}]` : ''
       const title = clampTerminalTitle(
-        `[Workflow: ${wf.name}] #${i + 1} ${step.name}${laneLabel} (${account.name}${personaLabel})`
+        `[Workflow: ${wf.name}] #${i + 1} ${step.name}${laneLabel} (${account.name}${personaBadge})`
       )
-      await orca.host.call('terminal.create', {
+      const created = await orca.host.call('terminal.create', {
         workspaceId: targetWorkspaceId,
         title,
         command
       })
+      entry.terminalId = created?.terminalId || null
+      entry.title = title
+
+      // Auto-link spawned workflow terminal to matching Agile Work Item so status syncs to board
+      const linkedWorkItem =
+        (goalType === 'workitem' && goalId
+          ? workItems.find((w) => w.id === goalId)
+          : null) ||
+        workItems.find(
+          (w) =>
+            w.status !== 'completed' &&
+            ((goalType === 'sprint' && goalId && w.sprintId === goalId) ||
+              (goalType === 'epic' && goalId && w.epicId === goalId)) &&
+            (w.assignedAccountId === account.id ||
+              (w.assignedPersona && w.assignedPersona === personaLabel))
+        )
+      if (entry.terminalId && linkedWorkItem) {
+        await linkTerminalToWorkItem(entry.terminalId, {
+          itemId: linkedWorkItem.id,
+          itemTitle: linkedWorkItem.title,
+          workspaceId: targetWorkspaceId,
+          stepLane: step.statusLane || null,
+          accountId: account.id
+        })
+      }
+
       await recordAccountActivity({
         accountId: account.id,
         type: 'workflow',
         title: `Workflow Step: ${step.name}`,
-        details: `Pipeline: "${wf.name}" (${step.statusLane || 'in-progress'})`,
+        details: `Pipeline: "${wf.name}" -> ${goalCtx.title} (${step.statusLane || 'in-progress'})`,
         workspaceId: targetWorkspaceId
       })
       startedCount++
     }
 
+    // Write live PEERS.json & refresh ROSTER.md with all spawned terminal IDs
+    await writeFile(rosterFile, `${buildRosterMd()}\n`, 'utf8')
+    await writeFile(
+      peersFile,
+      JSON.stringify(
+        {
+          workflow: wf.name,
+          goal: goalCtx.title,
+          mode: 'auto-agents',
+          peers: resolvedSteps.map((r) => ({
+            step: r.index,
+            name: r.step.name,
+            persona: r.personaLabel,
+            accountId: r.account?.id || r.step.accountId,
+            terminalId: r.terminalId,
+            title: r.title,
+            inboxFile: r.inboxFile
+          }))
+        },
+        null,
+        2
+      ),
+      'utf8'
+    )
+
     try {
       await orca.host.call('notifications.show', {
-        title: 'Antigravity Workflow Launched',
-        body: `Launched ${startedCount} agent step(s) for "${wf.name}"`
+        title: 'Antigravity Team Workflow Launched',
+        body: `Launched ${startedCount} persona agent(s) for "${wf.name}" (${goalCtx.title})`
       })
     } catch {}
 
     return {
       ok: true,
-      message: `Launched ${startedCount} agent steps for "${wf.name}"!`,
-      startedSteps: startedCount
+      mode: 'auto-agents',
+      startedSteps: startedCount,
+      coordinationDir: runDir,
+      message: `Launched ${startedCount} auto-coordinating persona agents for "${wf.name}" (${goalCtx.title})!`
     }
   })
 
@@ -1668,7 +2714,12 @@ export default async function activate(orca) {
     }
   })
 
+  orca.panels.handle('board.syncFromAgents', async ({ workspaceId } = {}) => {
+    return await syncAllLiveAgentsToBoard(workspaceId)
+  })
+
   orca.panels.handle('board.getAgileState', async () => {
+    await drainBoardSyncQueue().catch(() => {})
     const sprints = await getStoredSprints()
     const epics = await getStoredEpics()
     const workItems = await getStoredWorkItems()
@@ -1989,6 +3040,16 @@ export default async function activate(orca) {
       command
     })
 
+    // Link terminal to this work item so live agent states (working / waiting / review / done) auto-sync to the board
+    if (outcome?.terminalId) {
+      await linkTerminalToWorkItem(outcome.terminalId, {
+        itemId: item.id,
+        itemTitle: item.title,
+        workspaceId: targetWorkspaceId,
+        accountId: account.id
+      })
+    }
+
     // Advance status to in-progress if currently in todo
     if (item.status === 'todo') {
       item.status = 'in-progress'
@@ -2057,7 +3118,8 @@ export default async function activate(orca) {
 
   // --- 5. REAL-TIME QUOTA & TOKEN LIMITS HANDLERS ---
   orca.panels.handle('quota.getAccountQuota', async (params) => {
-    const accounts = await getStoredAccounts()
+    const storedAccounts = await getStoredAccounts()
+    const accounts = await syncAccountsEmailsFromAuth(storedAccounts, true)
     const forceRefresh = Boolean(params?.forceRefresh)
     const targetAccountId = params?.accountId
 

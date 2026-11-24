@@ -38,14 +38,18 @@ import type {
   AgileTaskStatus,
   AgileWorkItem,
   AntigravityAccount,
+  OrcaBotSummary,
   ProjectWorkflow,
   TotalUsageOverview,
+  WorkflowExecutionMode,
+  WorkflowGoalType,
   WorkflowStep,
   WorkspaceSummary
 } from './protocol'
 
-// Navigation Tab Atom: board | roadmap | workflows | accounts | usage
-const activeTab = atom<'board' | 'roadmap' | 'workflows' | 'accounts' | 'usage'>('board')
+// Navigation Tab Atom: start | board | roadmap | workflows | accounts | usage
+const activeTab = atom<'start' | 'board' | 'roadmap' | 'workflows' | 'accounts' | 'usage'>('start')
+const showBeginnerTips = atom<boolean>(true)
 
 // Accounts State
 const accounts = atom<AntigravityAccount[]>([])
@@ -90,9 +94,17 @@ const wfName = atom<string>('')
 const wfDesc = atom<string>('')
 const wfSteps = atom<WorkflowStep[]>([])
 
+// Team Launch Mode, Goal Target & Orca Bots State
+const orcaBots = atom<OrcaBotSummary[]>([])
+const wfLaunchMode = atom<WorkflowExecutionMode>('auto-agents')
+const wfGoalType = atom<WorkflowGoalType>('none')
+const wfGoalId = atom<string>('')
+const wfCustomGoal = atom<string>('')
+
 // New Step Form Atoms
 const newStepName = atom<string>('')
 const newStepAccountId = atom<string>('')
+const newStepBotName = atom<string>('')
 const newStepPrompt = atom<string>('')
 const newStepFlags = atom<string>('')
 const newStepStatusLane = atom<AgileTaskStatus>('in-progress')
@@ -346,16 +358,18 @@ async function refreshAll(showFeedback = false): Promise<void> {
     set(isBusy, true)
     set(statusNotice, null)
 
-    const [accRes, wsRes, boardRes, usageRes] = await Promise.all([
+    const [accRes, wsRes, boardRes, usageRes, botsRes] = await Promise.all([
       plugin.request('accounts.list'),
       plugin.request('accounts.getWorkspaces'),
       plugin.request('board.getAgileState'),
-      plugin.request('usage.getStats')
+      plugin.request('usage.getStats'),
+      plugin.request('bots.list').catch(() => ({ bots: [], botsDir: '' }))
     ])
 
     set(accounts, accRes.accounts)
     set(activeId, accRes.activeId)
     set(workspaces, wsRes.workspaces)
+    set(orcaBots, botsRes.bots || [])
     if (wsRes.activeWorkspaceId) {
       set(activeWorkspaceId, wsRes.activeWorkspaceId)
     }
@@ -415,6 +429,32 @@ async function openNativeWorkspaceBoard(): Promise<void> {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
     set(statusNotice, { tone: 'danger', message: `Could not open Workspace Board: ${msg}` })
+  }
+}
+
+/** Sync live agent terminal states onto Agile Board lanes */
+async function syncBoardFromAgents(): Promise<void> {
+  try {
+    set(isBusy, true)
+    const wsId = read(selectedWorkspaceId)
+    const payload: { workspaceId?: string } = {}
+    if (wsId && wsId !== 'active') payload.workspaceId = wsId
+    const res = await plugin.request('board.syncFromAgents', payload)
+    if (res.workItems) {
+      set(workItems, res.workItems)
+    }
+    set(statusNotice, {
+      tone: res.syncedCount > 0 ? 'success' : 'accent',
+      message:
+        res.syncedCount > 0
+          ? `Synced ${res.syncedCount} task(s) from live agent terminals: ${res.changes.map((c) => `${c.title} -> ${c.to}`).join(', ')}`
+          : 'All linked agent tasks are already in sync with live terminals.'
+    })
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    set(statusNotice, { tone: 'danger', message: `Agent board sync failed: ${msg}` })
+  } finally {
+    set(isBusy, false)
   }
 }
 
@@ -935,6 +975,7 @@ async function clearUsageData(accountId?: string): Promise<void> {
 function addWorkflowStep(): void {
   const name = read(newStepName).trim()
   const accountId = read(newStepAccountId) || read(accounts)[0]?.id || ''
+  const botName = read(newStepBotName).trim()
   const prompt = read(newStepPrompt).trim()
   const flags = read(newStepFlags).trim()
   const lane = read(newStepStatusLane)
@@ -954,12 +995,14 @@ function addWorkflowStep(): void {
     accountId,
     prompt,
     statusLane: lane,
+    ...(botName ? { botName } : {}),
     ...(flags ? { customFlags: flags } : {})
   }
 
   const existing = read(wfSteps)
   set(wfSteps, [...existing, step])
   set(newStepName, '')
+  set(newStepBotName, '')
   set(newStepPrompt, '')
   set(newStepFlags, '')
 }
@@ -1002,13 +1045,78 @@ async function saveWorkflow(): Promise<void> {
   }
 }
 
+/** Refresh local Orca Bots list */
+async function refreshOrcaBots(): Promise<void> {
+  try {
+    const res = await plugin.request('bots.list')
+    set(orcaBots, res.bots || [])
+    set(statusNotice, {
+      tone: 'accent',
+      message: `Discovered ${res.bots.length} local Orca Bot(s) in ${res.botsDir}.`
+    })
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    set(statusNotice, { tone: 'danger', message: `Failed to scan Orca Bots: ${msg}` })
+  }
+}
+
+/** One-click beginner launch helper: selects mode + optional active sprint and runs a workflow */
+async function quickLaunchPreset(
+  preferredWorkflowId: string,
+  useActiveSprint: boolean
+): Promise<void> {
+  const wfList = read(workflows)
+  const targetWf = wfList.find((w) => w.id === preferredWorkflowId) || wfList[0]
+  if (!targetWf) {
+    set(statusNotice, {
+      tone: 'danger',
+      message: 'No workflows available yet. Create one in the Startup Workflows tab.'
+    })
+    set(activeTab, 'workflows')
+    return
+  }
+
+  const sprintList = read(sprints)
+  const activeSp =
+    sprintList.find((s) => s.id === read(selectedSprintId)) ||
+    sprintList.find((s) => s.status === 'active') ||
+    sprintList[0]
+
+  if (useActiveSprint && activeSp) {
+    set(wfGoalType, 'sprint')
+    set(wfGoalId, activeSp.id)
+  } else {
+    set(wfGoalType, 'none')
+    set(wfGoalId, '')
+  }
+
+  await executeWorkflow(targetWf.id)
+}
+
 /** Execute team workflow */
 async function executeWorkflow(wfId: string): Promise<void> {
   const wsId = read(selectedWorkspaceId)
+  const mode = read(wfLaunchMode)
+  const goalType = read(wfGoalType)
+  const goalId = read(wfGoalId)
+  const customGoal = read(wfCustomGoal).trim()
   try {
     set(isBusy, true)
     set(statusNotice, null)
-    const payload: { workflowId: string; workspaceId?: string } = { workflowId: wfId }
+    const payload: {
+      workflowId: string
+      workspaceId?: string
+      mode: WorkflowExecutionMode
+      goalType?: WorkflowGoalType
+      goalId?: string
+      customGoal?: string
+    } = {
+      workflowId: wfId,
+      mode,
+      ...(goalType !== 'none' ? { goalType } : {}),
+      ...(goalType !== 'none' && goalId ? { goalId } : {}),
+      ...(customGoal ? { customGoal } : {})
+    }
     if (wsId && wsId !== 'active') payload.workspaceId = wsId
     const res = await plugin.request('workflows.execute', payload)
     set(statusNotice, { tone: 'success', message: res.message })
@@ -1105,6 +1213,10 @@ export default function Panel() {
   const curDeletingSprintId = read(deletingSprintId)
   const wsList = read(workspaces)
   const wfList = read(workflows)
+  const botList = read(orcaBots)
+  const launchMode = read(wfLaunchMode)
+  const goalType = read(wfGoalType)
+  const goalId = read(wfGoalId)
   const sprintList = read(sprints)
   const epicList = read(epics)
   const itemList = read(workItems)
@@ -1144,6 +1256,23 @@ export default function Panel() {
     label: `${a.name}${a.personaName ? ` [${a.personaName}]` : ''}`,
     value: a.id
   }))
+
+  const botOptions = [
+    { label: 'Auto-match by persona / None', value: '' },
+    ...botList.map((b) => ({
+      label: `bot:${b.name} (${b.agent})${b.specialty ? ` — ${b.specialty.slice(0, 48)}` : ''}`,
+      value: b.name
+    }))
+  ]
+
+  const goalTargetOptions =
+    goalType === 'sprint'
+      ? sprintList.map((s) => ({ label: `${s.name} [${s.status}]`, value: s.id }))
+      : goalType === 'epic'
+        ? epicList.map((e) => ({ label: `${e.name} [${e.status || 'in-progress'}]`, value: e.id }))
+        : goalType === 'workitem'
+          ? itemList.map((w) => ({ label: `[${w.status}] ${w.title}`, value: w.id }))
+          : []
 
   const epicOptions = epicList.map((e) => ({
     label: e.name,
@@ -1283,17 +1412,30 @@ export default function Panel() {
     }
   }
 
+  const tipsVisible = read(showBeginnerTips)
+  const readyAccountCount = accountList.filter((a) => quotasMap[a.id]?.status === 'ok').length
+  const hasWorkspaceReady = wsList.length > 0 || Boolean(currentActiveWsId || currentContext?.workspaceId)
+  const firstAccountForLogin =
+    accountList.find((a) => quotasMap[a.id]?.status === 'needs-login') || activeAccount || accountList[0]
+
   return (
-    <Stack gap="md" padding="md">
+    <Stack gap="md">
       {/* Header with Title and Global Actions */}
       <Row justify="between" align="center">
         <Stack gap="none">
           <Heading level={3}>Antigravity Flow</Heading>
           <Text size="xs" muted>
-            Agile Sprints, Roadmap, Orca Workspace Board, Personas & Token Quota
+            AI Team Workflows, Agile Sprints & Persona Coordination for Orca
           </Text>
         </Stack>
         <Row gap="xs" align="center">
+          <Button
+            variant={currentTab === 'start' ? 'solid' : 'outline'}
+            size="sm"
+            onPress={() => set(activeTab, currentTab === 'start' ? 'workflows' : 'start')}
+          >
+            {currentTab === 'start' ? 'Workflows' : 'Start Here'}
+          </Button>
           <IconButton
             icon="blocks"
             label="Open Orca Workspace Board"
@@ -1317,8 +1459,8 @@ export default function Panel() {
           <Row align="center" gap="xs">
             <Badge tone={read(selectedWorkspaceId) === 'active' ? 'accent' : 'neutral'}>
               {read(selectedWorkspaceId) === 'active'
-                ? '⚡ Active Workspace'
-                : '📌 Pinned Workspace'}
+                ? 'Active Workspace'
+                : 'Pinned Workspace'}
             </Badge>
             <Text size="xs" weight="medium">
               {read(selectedWorkspaceId) === 'active'
@@ -1359,9 +1501,226 @@ export default function Panel() {
         label="Antigravity Flow Sections"
         value={currentTab}
         onChange={(val) =>
-          set(activeTab, val as 'board' | 'roadmap' | 'workflows' | 'accounts' | 'usage')
+          set(
+            activeTab,
+            val as 'start' | 'board' | 'roadmap' | 'workflows' | 'accounts' | 'usage'
+          )
         }
       >
+        {/* ========================================================================= */}
+        {/* TAB 0: QUICK START (Beginner-Friendly Guided Setup & 1-Click Launch)      */}
+        {/* ========================================================================= */}
+        <Tab value="start" label="Start Here" icon="bot">
+          <Stack gap="md">
+            <Card
+              title="Welcome to Antigravity Flow"
+              description="New to Orca? Follow these 3 quick steps to launch an AI team that collaborates automatically."
+            >
+              <Stack gap="sm">
+                {/* Step 1: Workspace */}
+                <Row justify="between" align="center">
+                  <Stack gap="none">
+                    <Row gap="xs" align="center">
+                      <Badge tone={hasWorkspaceReady ? 'success' : 'neutral'}>
+                        {hasWorkspaceReady ? '1. Ready' : '1. Needed'}
+                      </Badge>
+                      <Text size="sm" weight="semibold">
+                        Choose an Orca Workspace
+                      </Text>
+                    </Row>
+                    <Text size="xs" muted>
+                      {hasWorkspaceReady
+                        ? `Targeting "${activeWsName}". Your AI team will edit code and run commands here.`
+                        : 'Open any project or Git worktree from Orca’s left sidebar first.'}
+                    </Text>
+                  </Stack>
+                </Row>
+
+                <Separator />
+
+                {/* Step 2: Account Sign-In */}
+                <Row justify="between" align="center">
+                  <Stack gap="none">
+                    <Row gap="xs" align="center">
+                      <Badge tone={readyAccountCount > 0 ? 'success' : 'accent'}>
+                        {readyAccountCount > 0 ? `2. ${readyAccountCount} Ready` : '2. Sign In'}
+                      </Badge>
+                      <Text size="sm" weight="semibold">
+                        Connect an Antigravity Account
+                      </Text>
+                    </Row>
+                    <Text size="xs" muted>
+                      {readyAccountCount > 0
+                        ? `${readyAccountCount} of ${accountList.length} persona account(s) signed in and ready.`
+                        : 'Sign in once so your AI personas can run Antigravity (agy) in Orca terminals.'}
+                    </Text>
+                  </Stack>
+                  <Row gap="xs">
+                    {firstAccountForLogin ? (
+                      <Button
+                        variant={readyAccountCount > 0 ? 'outline' : 'solid'}
+                        tone="accent"
+                        size="sm"
+                        disabled={busy}
+                        onPress={() => void loginAccount(firstAccountForLogin.id)}
+                      >
+                        {readyAccountCount > 0 ? 'Sign In Another' : 'Sign In Now'}
+                      </Button>
+                    ) : null}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onPress={() => set(activeTab, 'accounts')}
+                    >
+                      Manage
+                    </Button>
+                  </Row>
+                </Row>
+
+                <Separator />
+
+                {/* Step 3: Launch Mode */}
+                <Stack gap="xs">
+                  <Row gap="xs" align="center">
+                    <Badge tone="accent">3. Launch</Badge>
+                    <Text size="sm" weight="semibold">
+                      Pick How Your AI Team Runs
+                    </Text>
+                  </Row>
+                  <Select
+                    label="Team Mode"
+                    options={[
+                      {
+                        label: 'Auto Agent Team (Recommended — 100% automatic, zero setup)',
+                        value: 'auto-agents'
+                      },
+                      {
+                        label: `Orca Bots Team (${botList.length} local bot(s) found in Orca)`,
+                        value: 'orca-bots'
+                      }
+                    ]}
+                    value={launchMode}
+                    onChange={(val) =>
+                      set(wfLaunchMode, (val as WorkflowExecutionMode) || 'auto-agents')
+                    }
+                  />
+                  <Text size="xs" muted>
+                    {launchMode === 'orca-bots'
+                      ? 'Sends your goal to your existing Orca Bots so they message each other directly (bot:<name>).'
+                      : 'Spawns specialist AI personas in Orca terminals with a shared team chat room so they talk and hand off work automatically.'}
+                  </Text>
+                </Stack>
+              </Stack>
+            </Card>
+
+            {/* 1-Click Starter Missions */}
+            <Card
+              title="1-Click Starter Missions"
+              description="Start immediately — your team personas will automatically coordinate with each other."
+            >
+              <Stack gap="sm">
+                <Row justify="between" align="center">
+                  <Stack gap="none">
+                    <Text size="sm" weight="semibold">
+                      Finish Active Sprint
+                    </Text>
+                    <Text size="xs" muted>
+                      {activeSprint
+                        ? `Target: ${activeSprint.name} (${sprintItems.length} work item(s))`
+                        : 'Run full PM -> Architect -> Developer -> QA team on your sprint.'}
+                    </Text>
+                  </Stack>
+                  <Button
+                    variant="solid"
+                    tone="accent"
+                    size="sm"
+                    disabled={busy || !hasWorkspaceReady}
+                    onPress={() => void quickLaunchPreset('feature-epic-delivery', true)}
+                  >
+                    Launch Sprint Team
+                  </Button>
+                </Row>
+
+                <Separator />
+
+                <Row justify="between" align="center">
+                  <Stack gap="none">
+                    <Text size="sm" weight="semibold">
+                      Rapid Bugfix & Patch
+                    </Text>
+                    <Text size="xs" muted>
+                      QA reproduces the bug, Developer patches it, Security verifies the fix.
+                    </Text>
+                  </Stack>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={busy || !hasWorkspaceReady}
+                    onPress={() => void quickLaunchPreset('rapid-hotfix-sprint', false)}
+                  >
+                    Launch Hotfix
+                  </Button>
+                </Row>
+
+                <Separator />
+
+                <Row justify="between" align="center">
+                  <Stack gap="none">
+                    <Text size="sm" weight="semibold">
+                      Architecture & Tech Spike
+                    </Text>
+                    <Text size="xs" muted>
+                      Architect prototypes a solution and Developer estimates implementation effort.
+                    </Text>
+                  </Stack>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={busy || !hasWorkspaceReady}
+                    onPress={() => void quickLaunchPreset('tech-spike-sprint', false)}
+                  >
+                    Launch Spike
+                  </Button>
+                </Row>
+
+                <Row justify="end" gap="xs">
+                  <Button variant="ghost" size="sm" onPress={() => set(activeTab, 'board')}>
+                    Open Agile Board
+                  </Button>
+                  <Button variant="ghost" size="sm" onPress={() => set(activeTab, 'workflows')}>
+                    Customize Workflows
+                  </Button>
+                </Row>
+              </Stack>
+            </Card>
+
+            {/* Quick Orca Glossary for Newcomers */}
+            <Card
+              title="New to Orca? Quick Guide"
+              description="How each part of Antigravity Flow fits into Orca."
+            >
+              <Stack gap="xs">
+                <Text size="xs">
+                  • <Text weight="semibold">Workspace:</Text> Your Git branch/worktree in Orca where
+                  terminals and AI agents run safely.
+                </Text>
+                <Text size="xs">
+                  • <Text weight="semibold">Agile Board & Roadmap:</Text> Organize goals into Sprints,
+                  Epics, and Work Items (Todo → In Progress → In Review → Done).
+                </Text>
+                <Text size="xs">
+                  • <Text weight="semibold">Startup Workflows:</Text> Multi-persona teams that talk to
+                  each other automatically via their shared thread & Orca orchestration mail.
+                </Text>
+                <Text size="xs">
+                  • <Text weight="semibold">Accounts & Quotas:</Text> Isolate different Google
+                  Antigravity accounts per persona and monitor remaining token limits.
+                </Text>
+              </Stack>
+            </Card>
+          </Stack>
+        </Tab>
+
         {/* ========================================================================= */}
         {/* TAB 1: AGILE BOARD (Synchronized with Orca Workspace Board Lanes)         */}
         {/* ========================================================================= */}
@@ -1401,6 +1760,14 @@ export default function Panel() {
                         {activeSprint.status.toUpperCase()}
                       </Badge>
                     ) : null}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={busy}
+                      onPress={() => void syncBoardFromAgents()}
+                    >
+                      Sync Agents
+                    </Button>
                     <Button
                       variant="outline"
                       size="sm"
@@ -2083,6 +2450,116 @@ export default function Panel() {
               </Button>
             </Row>
 
+            {tipsVisible ? (
+              <Callout tone="accent">
+                <Row justify="between" align="center" gap="xs">
+                  <Text size="xs">
+                    How it works: Pick a mode and goal below, then click Launch. Every persona
+                    automatically gets a shared team thread and peer messaging so they talk to each
+                    other until the goal is done.
+                  </Text>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onPress={() => set(showBeginnerTips, false)}
+                  >
+                    Got it
+                  </Button>
+                </Row>
+              </Callout>
+            ) : null}
+
+            {/* Team Launch Mode & Goal Target Configuration */}
+            <Card
+              title="1. Choose Team Mode & Goal"
+              description="Recommended for beginners: leave Auto Agent Team selected, pick a Sprint/Epic/Work Item, and click Launch."
+            >
+              <Stack gap="sm">
+                <Select
+                  label="How should the team run?"
+                  options={[
+                    {
+                      label: 'Auto Agent Team (Recommended — 100% automatic, no bot setup)',
+                      value: 'auto-agents'
+                    },
+                    {
+                      label: `Orca Bots Team (Uses existing Orca Bots — ${botList.length} found)`,
+                      value: 'orca-bots'
+                    }
+                  ]}
+                  value={launchMode}
+                  onChange={(val) =>
+                    set(wfLaunchMode, (val as WorkflowExecutionMode) || 'auto-agents')
+                  }
+                />
+
+                <Select
+                  label="What should the team finish?"
+                  options={[
+                    { label: 'General Mission (Use workflow default instructions)', value: 'none' },
+                    { label: 'Finish a Sprint (all work items in sprint)', value: 'sprint' },
+                    { label: 'Finish an Epic (all work items in epic)', value: 'epic' },
+                    { label: 'Finish a Single Work Item', value: 'workitem' }
+                  ]}
+                  value={goalType}
+                  onChange={(val) => {
+                    const nextType = (val as WorkflowGoalType) || 'none'
+                    set(wfGoalType, nextType)
+                    if (nextType === 'sprint') {
+                      set(wfGoalId, sprintList[0]?.id || '')
+                    } else if (nextType === 'epic') {
+                      set(wfGoalId, epicList[0]?.id || '')
+                    } else if (nextType === 'workitem') {
+                      set(wfGoalId, itemList[0]?.id || '')
+                    } else {
+                      set(wfGoalId, '')
+                    }
+                  }}
+                />
+
+                {goalType !== 'none' && goalTargetOptions.length > 0 ? (
+                  <Select
+                    label={
+                      goalType === 'sprint'
+                        ? 'Select Target Sprint'
+                        : goalType === 'epic'
+                          ? 'Select Target Epic'
+                          : 'Select Target Work Item'
+                    }
+                    options={goalTargetOptions}
+                    value={goalId || goalTargetOptions[0]?.value || ''}
+                    onChange={(val) => set(wfGoalId, val ?? '')}
+                  />
+                ) : null}
+
+                <Input
+                  label="Extra Notes / Definition of Done (Optional)"
+                  placeholder="e.g. Make sure all tests pass and code is clean"
+                  value={read(wfCustomGoal)}
+                  onChange={(val) => set(wfCustomGoal, val)}
+                  disabled={busy}
+                />
+
+                {launchMode === 'orca-bots' ? (
+                  <Row justify="between" align="center">
+                    <Text size="xs" muted>
+                      {botList.length > 0
+                        ? `Ready Orca Bots: ${botList.map((b) => `bot:${b.name}`).join(', ')} (auto-assigned to steps by default)`
+                        : 'No Orca Bots found yet. Create a bot in Orca’s Bots sidebar or switch to Auto Agent Team.'}
+                    </Text>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={busy}
+                      onPress={() => void refreshOrcaBots()}
+                    >
+                      Refresh Bots
+                    </Button>
+                  </Row>
+                ) : null}
+              </Stack>
+            </Card>
+
             {/* Workflows List */}
             {wfList.length === 0 ? (
               <EmptyState
@@ -2099,23 +2576,13 @@ export default function Panel() {
                 >
                   <Stack gap="sm">
                     <Text size="xs" weight="medium">
-                      Pipeline Steps ({wf.steps.length}):
+                      Team Personas ({wf.steps.length} steps — auto-connected):
                     </Text>
                     <Stack gap="xs">
                       {wf.steps.map((st, idx) => {
                         const acc = accountList.find((a) => a.id === st.accountId)
                         return (
-                          <Row
-                            key={st.id}
-                            justify="between"
-                            align="center"
-                            padding="xs"
-                            style={{
-                              borderRadius: '4px',
-                              border: '1px solid var(--orca-border)',
-                              backgroundColor: 'var(--orca-background-secondary)'
-                            }}
-                          >
+                          <Row key={st.id} justify="between" align="center">
                             <Row gap="xs" align="center">
                               <Badge tone="neutral">#{idx + 1}</Badge>
                               <Text weight="medium">{st.name}</Text>
@@ -2126,6 +2593,9 @@ export default function Panel() {
                                 {acc ? acc.name : st.accountId}
                                 {acc?.personaName ? ` (${acc.personaName})` : ''}
                               </Badge>
+                              {st.botName ? (
+                                <Badge tone="accent">bot:{st.botName}</Badge>
+                              ) : null}
                             </Row>
                           </Row>
                         )
@@ -2139,7 +2609,9 @@ export default function Panel() {
                         disabled={busy}
                         onPress={() => void executeWorkflow(wf.id)}
                       >
-                        Launch Team Workflow
+                        {launchMode === 'orca-bots'
+                          ? 'Dispatch to Orca Bots'
+                          : 'Launch Auto Agent Team'}
                       </Button>
                     </Row>
                   </Stack>
@@ -2220,6 +2692,12 @@ export default function Panel() {
                         onChange={(val) => set(newStepAccountId, val ?? '')}
                       />
                     ) : null}
+                    <Select
+                      label="Map to Orca Bot (Optional — for Semi-Auto Bot Mode)"
+                      options={botOptions}
+                      value={read(newStepBotName)}
+                      onChange={(val) => set(newStepBotName, val ?? '')}
+                    />
                     <Select
                       label="Target Workspace Board Lane"
                       options={ORCA_LANES.map((l) => ({ label: l.label, value: l.id }))}
@@ -2428,11 +2906,14 @@ export default function Panel() {
                       <Stack gap="xs">
                         <Row justify="between" align="center">
                           <Stack gap="none">
-                            <Row gap="xs" align="center">
+                            <Row gap="xs" align="center" wrap>
                               <Text weight="semibold">{acc.name}</Text>
                               {isSelected ? <Badge tone="success">Active</Badge> : null}
                               {acc.personaName ? (
                                 <Badge tone="accent">{acc.personaName}</Badge>
+                              ) : null}
+                              {acc.email ? (
+                                <Badge tone="neutral">{acc.email}</Badge>
                               ) : null}
                             </Row>
                             <Text size="xs" muted>

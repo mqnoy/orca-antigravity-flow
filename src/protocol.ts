@@ -78,6 +78,24 @@ export interface AgileWorkItem {
   updatedAt: number
 }
 
+export type WorkflowExecutionMode = 'auto-agents' | 'orca-bots'
+
+export type WorkflowGoalType = 'none' | 'sprint' | 'epic' | 'workitem'
+
+export interface OrcaBotSummary {
+  id: string
+  name: string
+  agent: string
+  specialty?: string | null
+  homeDir: string
+}
+
+export interface WorkflowGoalTarget {
+  type: WorkflowGoalType
+  id?: string
+  customGoal?: string
+}
+
 export interface WorkflowStep {
   id: string
   name: string
@@ -86,6 +104,8 @@ export interface WorkflowStep {
   customFlags?: string
   role?: string
   statusLane?: AgileTaskStatus
+  /** Optional Orca Bot name mapped to this step for Semi-Auto Bot mode. */
+  botName?: string
 }
 
 export interface ProjectWorkflow {
@@ -96,6 +116,8 @@ export interface ProjectWorkflow {
   workspaceId?: string
   sprintId?: string
   epicId?: string
+  executionMode?: WorkflowExecutionMode
+  goalTarget?: WorkflowGoalTarget
   steps: WorkflowStep[]
 }
 
@@ -305,16 +327,45 @@ declare module 'orca' {
       }
     }
 
-    /** Execute all agent steps in a workflow sequentially/concurrently. */
+    /** Discover local Orca Bots configured in ~/.orca/bots. */
+    'bots.list': {
+      input: void | Record<string, never>
+      output: {
+        bots: OrcaBotSummary[]
+        botsDir: string
+      }
+    }
+
+    /** Execute all agent steps in a workflow in 100% Auto Agents mode or Semi-Auto Orca Bots mode. */
     'workflows.execute': {
       input: {
         workflowId: string
         workspaceId?: string
+        mode?: WorkflowExecutionMode
+        goalType?: WorkflowGoalType
+        goalId?: string
+        customGoal?: string
       }
       output: {
         ok: boolean
         message: string
         startedSteps: number
+        mode: WorkflowExecutionMode
+        dispatchedBots?: string[]
+        missingBots?: string[]
+        coordinationDir?: string
+      }
+    }
+
+    /** Sync live terminal agent states and queued agent status updates onto Agile Board lanes */
+    'board.syncFromAgents': {
+      input: {
+        workspaceId?: string
+      } | void
+      output: {
+        syncedCount: number
+        changes: { itemId: string; title: string; from: AgileTaskStatus; to: AgileTaskStatus; reason: string }[]
+        workItems: AgileWorkItem[]
       }
     }
 
